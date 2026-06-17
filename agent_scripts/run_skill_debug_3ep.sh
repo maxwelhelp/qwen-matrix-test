@@ -19,9 +19,13 @@ N_SYNTH="${N_SYNTH:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-1024}"
 HIDDEN="${HIDDEN:-512}"
 DEVICE="${DEVICE:-cuda}"
+# Optional: pass an existing dataset.pt to skip parse/build entirely.
+# Example: DATASET_PATH=neural_matrix_program_dataset_v3/runs/.../synthetic/dataset.pt bash agent_scripts/run_skill_debug_3ep.sh
+DATASET_PATH="${DATASET_PATH:-}"
 
 TOOL="neural_matrix_program_dataset_v3/neural_matrix_program_dataset_v3.py"
 RUN_ROOT="neural_matrix_program_dataset_v3/runs/agent_skill_debug_${STAMP}"
+DATASET_RUN="$RUN_ROOT/dataset_base"
 
 printf '\n[agent] repo=%s\n' "$ROOT"
 printf '[agent] report_dir=%s\n' "$REPORT_DIR"
@@ -105,7 +109,7 @@ PY
 printf '\n[agent] patch confirmation:\n'
 grep -n "init-decoder\|resume-decoder\|loaded init decoder" "$TOOL" || true
 
-COMMON_SYNTH=(
+COMMON_BUILD=(
   --parse-dir ./simple_butterfly_matrix_v3 ./simple_butterfly_matrix_v2 ./simple_butterfly_matrix
   --n "$N_SYNTH"
   --D 32
@@ -115,11 +119,8 @@ COMMON_SYNTH=(
   --primitive-slots 3
   --max-program-steps 16
   --device "$DEVICE"
-  --batch-size "$BATCH_SIZE"
-  --hidden "$HIDDEN"
   --max-parse-files 300
   --log-every 500
-  --log-every-epoch 1
 )
 
 COMMON_TRAIN=(
@@ -140,26 +141,44 @@ copy_metrics() {
   fi
 }
 
+if [[ -n "$DATASET_PATH" ]]; then
+  if [[ ! -f "$DATASET_PATH" ]]; then
+    echo "[agent][ERROR] DATASET_PATH does not exist: $DATASET_PATH" >&2
+    exit 2
+  fi
+  DATASET="$DATASET_PATH"
+  printf '\n[agent] using existing cached dataset: %s\n' "$DATASET"
+else
+  printf '\n[agent] build dataset once only; all 4 train runs reuse this dataset.pt\n'
+  python "$TOOL" build-synth \
+    "${COMMON_BUILD[@]}" \
+    --out "$DATASET_RUN"
+  DATASET="$DATASET_RUN/synthetic/dataset.pt"
+fi
+
+printf '\n[agent] dataset=%s\n' "$DATASET"
+ls -lh "$DATASET" || true
+
 printf '\n[agent] run 1/4: fresh baseline, no resume\n'
-python "$TOOL" all \
-  "${COMMON_SYNTH[@]}" \
+python "$TOOL" train-synth \
+  --dataset "$DATASET" \
   --out "$RUN_ROOT/fresh_a" \
-  --epochs "$EPOCHS"
+  "${COMMON_TRAIN[@]}"
 copy_metrics fresh_a "$RUN_ROOT/fresh_a"
 
 printf '\n[agent] run 2/4: resume from fresh_a baseline_decoder.pt on same dataset\n'
 python "$TOOL" train-synth \
-  --dataset "$RUN_ROOT/fresh_a/synthetic/dataset.pt" \
+  --dataset "$DATASET" \
   --out "$RUN_ROOT/resume_from_fresh_a" \
   "${COMMON_TRAIN[@]}" \
   --init-decoder "$RUN_ROOT/fresh_a/synthetic/baseline_decoder.pt"
 copy_metrics resume_from_fresh_a "$RUN_ROOT/resume_from_fresh_a"
 
-printf '\n[agent] run 3/4: masked/denoising fresh\n'
-python "$TOOL" all \
-  "${COMMON_SYNTH[@]}" \
+printf '\n[agent] run 3/4: masked/denoising fresh on same dataset\n'
+python "$TOOL" train-synth \
+  --dataset "$DATASET" \
   --out "$RUN_ROOT/masked_fresh" \
-  --epochs "$EPOCHS" \
+  "${COMMON_TRAIN[@]}" \
   --matrix-mask-frac 0.15 \
   --matrix-rowcol-mask-frac 0.05 \
   --matrix-noise-std 0.02
@@ -167,7 +186,7 @@ copy_metrics masked_fresh "$RUN_ROOT/masked_fresh"
 
 printf '\n[agent] run 4/4: masked/denoising resume from masked_fresh baseline_decoder.pt\n'
 python "$TOOL" train-synth \
-  --dataset "$RUN_ROOT/masked_fresh/synthetic/dataset.pt" \
+  --dataset "$DATASET" \
   --out "$RUN_ROOT/masked_resume" \
   "${COMMON_TRAIN[@]}" \
   --init-decoder "$RUN_ROOT/masked_fresh/synthetic/baseline_decoder.pt" \
@@ -219,7 +238,6 @@ for fn in files:
             else:
                 print(f"{k}: {v}")
 
-# explicit deltas: higher is better for f1/exact/acc, lower is better for KL.
 def load(name):
     p = rd / name
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
@@ -243,6 +261,14 @@ REPORT="$REPORT_DIR/REPORT_TO_CHATGPT.txt"
   echo "## git"
   git rev-parse HEAD 2>/dev/null || true
   git status --short 2>/dev/null || true
+  echo
+  echo "## config"
+  echo "EPOCHS=$EPOCHS"
+  echo "N_SYNTH=$N_SYNTH"
+  echo "BATCH_SIZE=$BATCH_SIZE"
+  echo "HIDDEN=$HIDDEN"
+  echo "DEVICE=$DEVICE"
+  echo "DATASET=$DATASET"
   echo
   echo "## patch grep"
   grep -n "init-decoder\|resume-decoder\|loaded init decoder" "$TOOL" || true
