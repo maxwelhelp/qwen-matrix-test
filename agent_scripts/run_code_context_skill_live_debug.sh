@@ -4,9 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-bash agent_scripts/patch_assembler_context_softflow.sh
-bash agent_scripts/patch_task_context_v2_force.sh
-bash agent_scripts/patch_task_context_batch_and_load.sh
+APPLY_PATCHES="${APPLY_PATCHES:-0}"
+if [[ "$APPLY_PATCHES" == "1" ]]; then
+  bash agent_scripts/patch_assembler_context_softflow.sh
+  bash agent_scripts/patch_task_context_v2_force.sh
+  bash agent_scripts/patch_task_context_batch_and_load.sh
+fi
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 REPORT_DIR="agent_reports/code_context_skill_live_${STAMP}"
@@ -29,6 +32,9 @@ AUDIO_MODES="${AUDIO_MODES:-delta freeze_core full}"
 N_CODE="${N_CODE:-6000}"
 LOG_EVERY="${LOG_EVERY:-50}"
 AUDIO_LAMBDA_SKILL="${AUDIO_LAMBDA_SKILL:-0.001}"
+TRAIN_TASK_CONTEXT="${TRAIN_TASK_CONTEXT:-1}"
+AMP_SKILL="${AMP_SKILL:-fp32}"
+AMP_AUDIO="${AMP_AUDIO:-fp32}"
 PARSE_DIRS="${PARSE_DIRS:-simple_butterfly_matrix_v3 simple_butterfly_matrix_v4 matrix_program_core}"
 MAX_PARSE_FILES="${MAX_PARSE_FILES:-128}"
 
@@ -36,6 +42,10 @@ printf '\n[code-context] repo=%s\n' "$ROOT"
 printf '[code-context] report_dir=%s\n' "$REPORT_DIR"
 printf '[code-context] parse_dirs=%s\n' "$PARSE_DIRS"
 printf '[code-context] code_epochs=%s audio_epochs=%s modes=%s n_code=%s\n\n' "$EPOCHS_CODE" "$EPOCHS_AUDIO" "$AUDIO_MODES" "$N_CODE"
+TASK_CONTEXT_FLAG="--train-task-context"
+if [[ "$TRAIN_TASK_CONTEXT" == "0" ]]; then
+  TASK_CONTEXT_FLAG="--no-train-task-context"
+fi
 
 git rev-parse --short HEAD 2>/dev/null | sed 's/^/[code-context] git_head=/' || true
 
@@ -47,7 +57,7 @@ python matrix_program_core/train_assembler_code_context_pretrain.py \
   --max-parse-files "$MAX_PARSE_FILES" \
   --out-dir "$CODE_OUT" \
   --device cuda \
-  --amp bf16 \
+  --amp "$AMP_SKILL" \
   --n "$N_CODE" \
   --matrix-D 32 \
   --dim 96 \
@@ -80,13 +90,15 @@ for MODE in $AUDIO_MODES; do
   python matrix_program_core/transfer_audio_assembler.py \
     --data-root ../architecture_builder/data/speechcommands \
     --assembler-checkpoint "$CODE_CKPT" \
+    --skill-target-pack "$CODE_OUT/code_context_dataset.pt" \
     --out-dir "$OUT" \
     --train-mode "$MODE" \
     --task-context-tokens 4 \
     --head-context-tokens 10 \
     --use-head-context \
+    "$TASK_CONTEXT_FLAG" \
     --device cuda \
-    --amp fp32 \
+    --amp "$AMP_AUDIO" \
     --classes yes,no,up,down,left,right,on,off,stop,go \
     --train-limit 12000 \
     --val-limit 2000 \
@@ -171,6 +183,9 @@ REPORT="$REPORT_DIR/REPORT_TO_CHATGPT.txt"
   echo "EPOCHS_AUDIO=$EPOCHS_AUDIO"
   echo "AUDIO_MODES=$AUDIO_MODES"
   echo "AUDIO_LAMBDA_SKILL=$AUDIO_LAMBDA_SKILL"
+  echo "TRAIN_TASK_CONTEXT=$TRAIN_TASK_CONTEXT"
+  echo "AMP_SKILL=$AMP_SKILL"
+  echo "AMP_AUDIO=$AMP_AUDIO"
   echo
   echo "## summary"
   cat "$REPORT_DIR/summary.txt"

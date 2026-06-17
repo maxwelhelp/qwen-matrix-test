@@ -4,9 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-bash agent_scripts/patch_assembler_context_softflow.sh
-bash agent_scripts/patch_task_context_v2_force.sh
-bash agent_scripts/patch_task_context_batch_and_load.sh
+APPLY_PATCHES="${APPLY_PATCHES:-0}"
+if [[ "$APPLY_PATCHES" == "1" ]]; then
+  bash agent_scripts/patch_assembler_context_softflow.sh
+  bash agent_scripts/patch_task_context_v2_force.sh
+  bash agent_scripts/patch_task_context_batch_and_load.sh
+fi
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 REPORT_DIR="agent_reports/context_skill_live_${STAMP}"
@@ -32,11 +35,18 @@ LOG_EVERY="${LOG_EVERY:-10}"
 AUDIO_LAMBDA_SKILL="${AUDIO_LAMBDA_SKILL:-0.001}"
 TASK_CONTEXT_TOKENS="${TASK_CONTEXT_TOKENS:-4}"
 HEAD_CONTEXT_TOKENS="${HEAD_CONTEXT_TOKENS:-10}"
+TRAIN_TASK_CONTEXT="${TRAIN_TASK_CONTEXT:-1}"
+AMP_SKILL="${AMP_SKILL:-fp32}"
+AMP_AUDIO="${AMP_AUDIO:-fp32}"
 
 printf '\n[context-skill] repo=%s\n' "$ROOT"
 printf '[context-skill] report_dir=%s\n' "$REPORT_DIR"
 printf '[context-skill] context_epochs=%s audio_epochs=%s modes=%s train_n=%s val_n=%s\n' "$EPOCHS_CONTEXT" "$EPOCHS_AUDIO" "$AUDIO_MODES" "$TRAIN_N" "$VAL_N"
 printf '[context-skill] export_dir=%s\n\n' "$EXPORT_ROOT"
+TASK_CONTEXT_FLAG="--train-task-context"
+if [[ "$TRAIN_TASK_CONTEXT" == "0" ]]; then
+  TASK_CONTEXT_FLAG="--no-train-task-context"
+fi
 
 git rev-parse --short HEAD 2>/dev/null | sed 's/^/[context-skill] git_head=/' || true
 
@@ -44,7 +54,7 @@ printf '\n[context-skill] pretrain assembly skill from context only: no classifi
 python matrix_program_core/train_assembler_context_skill_pretrain.py \
   --out-dir "$CONTEXT_OUT" \
   --device cuda \
-  --amp bf16 \
+  --amp "$AMP_SKILL" \
   --train-n "$TRAIN_N" \
   --val-n "$VAL_N" \
   --dim 96 \
@@ -84,8 +94,9 @@ for MODE in $AUDIO_MODES; do
     --task-context-tokens "$TASK_CONTEXT_TOKENS" \
     --head-context-tokens "$HEAD_CONTEXT_TOKENS" \
     --use-head-context \
+    "$TASK_CONTEXT_FLAG" \
     --device cuda \
-    --amp fp32 \
+    --amp "$AMP_AUDIO" \
     --classes yes,no,up,down,left,right,on,off,stop,go \
     --train-limit 12000 \
     --val-limit 2000 \

@@ -9,6 +9,7 @@ Clean transfer:
 Train modes:
 
     freeze_core  : train only input adapter + head
+    editor_delta : train only soft flow editor/phase deltas + adapter + head
     delta        : train only *_delta inside assembler + adapter + head
     full         : train full assembler + adapter + head
 """
@@ -36,7 +37,21 @@ from matrix_program_core.assembler_core import (  # noqa: E402
     MatrixProgramAssemblerCore,
     assembler_skill_loss,
 )
-from matrix_program_core.train_assembler_pretrain import build_flow_targets  # noqa: E402
+from matrix_program_core.task_context_v2 import (  # noqa: E402
+    TaskContextV2Config,
+    TaskIOContextEncoder,
+    ROLE_TASK_HEAD_CORE,
+    INPUT_AUDIO_FEATURES,
+    OUTPUT_CLASS_LOGITS,
+    LOSS_CROSS_ENTROPY,
+    READOUT_CLASS_QUERY,
+)
+from matrix_program_core.train_assembler_mechanism_skill_pretrain import (  # noqa: E402
+    FLOW_KEYS,
+    TASK_FAMILIES,
+    MechanismEvidenceBuilder,
+)
+from simple_butterfly_matrix.simple_butterfly_matrix import PRIMITIVES  # noqa: E402
 from simple_butterfly_matrix.simple_butterfly_matrix import (  # noqa: E402
     MatrixEvidence,
     amp_dtype,
@@ -80,6 +95,52 @@ class AudioAssemblerHead(nn.Module):
         return logits, {"class_slot_attention": attn.detach(), "class_read": read.detach()}
 
 
+class AudioMechanismContextAdapter(nn.Module):
+    """Differentiable bridge from audio/head state to mechanism-flow summaries."""
+
+    def __init__(self, cfg: AssemblerConfig, dim: int):
+        super().__init__()
+        self.cfg = cfg
+        self.T = int(cfg.layers * cfg.steps)
+        self.A = int(cfg.address_cells)
+        self.B = int(cfg.blocks)
+        self.K = int(cfg.primitive_slots)
+        self.P = len(PRIMITIVES)
+        self.audio_proj = nn.Linear(dim, dim)
+        self.head_proj = nn.Linear(dim, dim, bias=False)
+        self.mix = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+        )
+        self.out = nn.ModuleDict({
+            "read_flow": nn.Linear(dim, self.T * self.A),
+            "primitive_slot_flow": nn.Linear(dim, self.T * self.P),
+            "slot_transition_flow": nn.Linear(dim, self.T * self.K * self.K),
+            "primitive_transition_flow": nn.Linear(dim, self.T * self.P * self.P),
+            "slot_composition_flow": nn.Linear(dim, self.T * self.K),
+            "write_flow": nn.Linear(dim, self.T * self.A),
+        })
+
+    def _dist(self, logits: torch.Tensor, shape, dim: int = -1) -> torch.Tensor:
+        return torch.softmax(logits.view(*shape).float(), dim=dim)
+
+    def forward(self, evidence: torch.Tensor, head_query: torch.Tensor) -> Dict[str, torch.Tensor]:
+        N = int(evidence.shape[0])
+        a = self.audio_proj(evidence.mean(dim=1).float())
+        h = self.head_proj(head_query.float().mean(dim=0, keepdim=True)).expand(N, -1)
+        z = self.mix(a + h)
+        return {
+            "read_flow": self._dist(self.out["read_flow"](z), (N, self.T, self.A)),
+            "primitive_slot_flow": self._dist(self.out["primitive_slot_flow"](z), (N, self.T, self.P)),
+            "slot_transition_flow": self._dist(self.out["slot_transition_flow"](z), (N, self.T, self.K * self.K)),
+            "primitive_transition_flow": self._dist(self.out["primitive_transition_flow"](z), (N, self.T, self.P * self.P)),
+            "slot_composition_flow": self._dist(self.out["slot_composition_flow"](z), (N, self.T, self.K)),
+            "write_flow": self._dist(self.out["write_flow"](z), (N, self.T, self.A)),
+        }
+
+
 class AudioAssemblerModel(nn.Module):
     def __init__(self, classes: int, args):
         super().__init__()
@@ -99,9 +160,53 @@ class AudioAssemblerModel(nn.Module):
         )
         self.assembler_core = MatrixProgramAssemblerCore(cfg)
         self.head = AudioAssemblerHead(args.dim, classes, args.head_dropout)
+        self.use_mechanism_context = bool(getattr(args, "use_mechanism_context", False))
+        self.mechanism_builder = MechanismEvidenceBuilder(cfg, args.dim, dropout=args.dropout) if self.use_mechanism_context else None
+        self.mechanism_adapter = AudioMechanismContextAdapter(cfg, args.dim) if self.use_mechanism_context else None
+        self.mechanism_task_id = int(getattr(args, "mechanism_task_id", max(0, len(TASK_FAMILIES) - 1)))
+
+        # Generic task I/O contract, not a hardcoded classification branch.
+        # For attention/layer replacement another script can pass different IDs,
+        # but the core still only sees dense context tokens and soft matrices.
+        self.role_id = int(getattr(args, "role_id", ROLE_TASK_HEAD_CORE))
+        self.input_kind_id = int(getattr(args, "input_kind_id", INPUT_AUDIO_FEATURES))
+        self.output_kind_id = int(getattr(args, "output_kind_id", OUTPUT_CLASS_LOGITS))
+        self.loss_kind_id = int(getattr(args, "loss_kind_id", LOSS_CROSS_ENTROPY))
+        self.readout_kind_id = int(getattr(args, "readout_kind_id", READOUT_CLASS_QUERY))
+        self.use_head_context = bool(getattr(args, "use_head_context", True))
+        self.task_context = TaskIOContextEncoder(TaskContextV2Config(
+            dim=args.dim,
+            free_tokens=int(getattr(args, "task_context_tokens", 4)),
+            max_head_tokens=int(getattr(args, "head_context_tokens", classes)),
+            dropout=args.dropout,
+        ))
 
     def forward(self, wav: torch.Tensor):
         evidence = self.input_adapter(wav)
+        head_query = self.head.query if self.use_head_context else None
+        context = self.task_context(
+            evidence.shape[0],
+            evidence.device,
+            evidence.dtype,
+            role_id=self.role_id,
+            input_kind_id=self.input_kind_id,
+            output_kind_id=self.output_kind_id,
+            loss_kind_id=self.loss_kind_id,
+            readout_kind_id=self.readout_kind_id,
+            num_outputs=float(self.head.classes),
+            sequence_length=float(evidence.shape[1]),
+            hidden_dim=float(evidence.shape[-1]),
+            head_query=head_query,
+        )
+        parts = [context]
+        if self.use_mechanism_context and self.mechanism_builder is not None and self.mechanism_adapter is not None:
+            summaries = self.mechanism_adapter(evidence, self.head.query)
+            visible = torch.ones(evidence.shape[0], len(FLOW_KEYS), device=evidence.device, dtype=torch.float32)
+            task_ids = torch.full((evidence.shape[0],), self.mechanism_task_id, device=evidence.device, dtype=torch.long)
+            mech = self.mechanism_builder(summaries, visible, task_ids).to(dtype=evidence.dtype)
+            parts.append(mech)
+        parts.append(evidence)
+        evidence = torch.cat(parts, dim=1)
         _cells, aux = self.assembler_core(evidence)
         logits, haux = self.head(aux.slots)
         return logits, aux, haux
@@ -112,25 +217,184 @@ def trainable_summary(model: AudioAssemblerModel) -> Dict[str, int]:
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     core_total = sum(p.numel() for p in model.assembler_core.parameters())
     core_train = sum(p.numel() for p in model.assembler_core.parameters() if p.requires_grad)
-    return {"total": total, "trainable": trainable, "core_total": core_total, "core_trainable": core_train}
+    context_total = sum(p.numel() for p in model.task_context.parameters())
+    context_train = sum(p.numel() for p in model.task_context.parameters() if p.requires_grad)
+    mech_total = 0
+    mech_train = 0
+    if model.mechanism_builder is not None:
+        mech_total += sum(p.numel() for p in model.mechanism_builder.parameters())
+        mech_train += sum(p.numel() for p in model.mechanism_builder.parameters() if p.requires_grad)
+    if model.mechanism_adapter is not None:
+        mech_total += sum(p.numel() for p in model.mechanism_adapter.parameters())
+        mech_train += sum(p.numel() for p in model.mechanism_adapter.parameters() if p.requires_grad)
+    return {
+        "total": total,
+        "trainable": trainable,
+        "core_total": core_total,
+        "core_trainable": core_train,
+        "task_context_total": context_total,
+        "task_context_trainable": context_train,
+        "mechanism_context_total": mech_total,
+        "mechanism_context_trainable": mech_train,
+    }
 
 
-def configure_train_mode(model: AudioAssemblerModel, mode: str, train_input_adapter: bool, train_head: bool) -> None:
+def configure_train_mode(model: AudioAssemblerModel, mode: str, train_input_adapter: bool, train_head: bool, train_task_context: bool) -> None:
     model.assembler_core.freeze_for_mode(mode)
     for p in model.input_adapter.parameters():
         p.requires_grad = bool(train_input_adapter)
     for p in model.head.parameters():
         p.requires_grad = bool(train_head)
+    for p in model.task_context.parameters():
+        p.requires_grad = bool(train_task_context)
+    if model.mechanism_builder is not None:
+        for p in model.mechanism_builder.parameters():
+            p.requires_grad = False
+    if model.mechanism_adapter is not None:
+        for p in model.mechanism_adapter.parameters():
+            p.requires_grad = bool(train_input_adapter)
 
 
-def aux_losses(logits: torch.Tensor, aux, args, flow_targets, skill_weights) -> Dict[str, torch.Tensor]:
-    skill, flow_losses = assembler_skill_loss(aux, flow_targets, skill_weights)
+def _is_tensor_state(obj) -> bool:
+    return isinstance(obj, dict) and bool(obj) and all(torch.is_tensor(v) for v in obj.values())
+
+
+def _strip_prefix_state(state: Dict[str, torch.Tensor], prefixes: Tuple[str, ...]) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        new_key = key
+        for prefix in prefixes:
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix):]
+                break
+        out[new_key] = value
+    return out
+
+
+def _extract_core_state(ckpt) -> Dict[str, torch.Tensor]:
+    if not isinstance(ckpt, dict):
+        raise TypeError("assembler checkpoint must be a dict")
+    for key in ("assembler_core", "core", "assembler_skill_base"):
+        state = ckpt.get(key)
+        if _is_tensor_state(state):
+            return _strip_prefix_state(state, ("assembler_core.", "core."))
+    model_state = ckpt.get("model")
+    if isinstance(model_state, dict):
+        state = {
+            key: value
+            for key, value in model_state.items()
+            if key.startswith("assembler_core.") or key.startswith("core.")
+        }
+        if state:
+            return _strip_prefix_state(state, ("assembler_core.", "core."))
+    if _is_tensor_state(ckpt):
+        return _strip_prefix_state(ckpt, ("assembler_core.", "core."))
+    raise KeyError("assembler checkpoint has no assembler_core/core/assembler_skill_base/model core state")
+
+
+def _extract_task_context_state(ckpt) -> Dict[str, torch.Tensor]:
+    if not isinstance(ckpt, dict):
+        return {}
+    for key in ("task_context", "task_context_base"):
+        state = ckpt.get(key)
+        if _is_tensor_state(state):
+            return _strip_prefix_state(state, ("task_context.",))
+    model_state = ckpt.get("model")
+    if isinstance(model_state, dict):
+        state = {
+            key: value
+            for key, value in model_state.items()
+            if key.startswith("task_context.")
+        }
+        if state:
+            return _strip_prefix_state(state, ("task_context.",))
+    return {}
+
+
+def _extract_mechanism_builder_state(ckpt) -> Dict[str, torch.Tensor]:
+    if not isinstance(ckpt, dict):
+        return {}
+    state = ckpt.get("mechanism_evidence_builder")
+    if _is_tensor_state(state):
+        return state
+    state = ckpt.get("mechanism_context_base")
+    if _is_tensor_state(state):
+        return _strip_prefix_state(state, ("mechanism_evidence_builder.", "mechanism_builder."))
+    return {}
+
+
+def _normalize_flow_target(x: torch.Tensor, cfg: AssemblerConfig) -> torch.Tensor:
+    x = x.float()
+    total_steps = int(cfg.layers * cfg.steps)
+    if x.ndim >= 2 and x.shape[0] != total_steps and x.shape[1] == total_steps:
+        x = x.mean(dim=0)
+    return x / x.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+def load_skill_target_pack(path: str | Path, cfg: AssemblerConfig, device: torch.device) -> Dict[str, torch.Tensor]:
+    pack = torch.load(path, map_location="cpu")
+    targets: Dict[str, torch.Tensor] = {}
+    for key in ("read_flow", "primitive_slot_flow", "slot_transition_flow", "primitive_transition_flow", "slot_composition_flow", "write_flow"):
+        value = pack.get(key) if isinstance(pack, dict) else None
+        if torch.is_tensor(value):
+            targets[key] = _normalize_flow_target(value, cfg).to(device)
+    if not targets:
+        raise ValueError(f"skill target pack has no flow tensors: {path}")
+    return targets
+
+
+def build_prior_flow_targets(cfg: AssemblerConfig, device: torch.device) -> Dict[str, torch.Tensor]:
+    # Kept as an explicit debug baseline. Normal transfer should use the skill
+    # weights themselves, optionally regularized by a real/code flow pack.
+    from matrix_program_core.train_assembler_pretrain import build_flow_targets
+
+    return build_flow_targets(cfg, device)
+
+
+def make_runtime_flow_targets(args, cfg: AssemblerConfig, device: torch.device) -> Dict[str, torch.Tensor]:
+    if args.skill_target_pack:
+        targets = load_skill_target_pack(args.skill_target_pack, cfg, device)
+        print(f"loaded skill target pack: {args.skill_target_pack} keys={sorted(targets)}", flush=True)
+        return targets
+    if args.use_prior_skill_targets:
+        print("using generic prior skill targets; this is a debug baseline, not dataset-transfer supervision", flush=True)
+        return build_prior_flow_targets(cfg, device)
+    if args.lambda_skill > 0:
+        print("lambda_skill > 0 but no --skill-target-pack/--use-prior-skill-targets; disabling live skill anchor", flush=True)
+    return {}
+
+
+def class_read_diversity_loss(attn: torch.Tensor) -> torch.Tensor:
+    # attn [N,C,S]. Penalize classes that read the same slot distribution.
+    a = attn.float().mean(dim=0)
+    a = F.normalize(a, dim=-1)
+    sim = a @ a.t()
+    offdiag = sim - torch.eye(sim.shape[0], device=sim.device)
+    return F.relu(offdiag - 0.25).mean()
+
+
+def slot_diversity_loss(slots: torch.Tensor) -> torch.Tensor:
+    s = slots.float().mean(dim=0)
+    s = F.normalize(s, dim=-1)
+    sim = s @ s.t()
+    offdiag = sim - torch.eye(sim.shape[0], device=sim.device)
+    return F.relu(offdiag - 0.55).mean()
+
+
+def aux_losses(logits: torch.Tensor, aux, haux, args, flow_targets, skill_weights) -> Dict[str, torch.Tensor]:
+    if flow_targets:
+        skill, flow_losses = assembler_skill_loss(aux, flow_targets, skill_weights)
+    else:
+        skill = torch.zeros((), device=logits.device)
+        flow_losses = {}
     gate = aux.write_gates.float()
     upd = aux.update_norms.float()
     out: Dict[str, torch.Tensor] = dict(flow_losses)
     out["skill"] = skill
     out["write_budget"] = (gate.mean() - args.write_target).pow(2) if gate.numel() else torch.zeros((), device=logits.device)
     out["update_alive"] = F.relu(torch.tensor(float(args.min_update_norm), device=logits.device) - upd.mean()).pow(2) if upd.numel() else torch.zeros((), device=logits.device)
+    out["class_read_div"] = class_read_diversity_loss(haux["class_slot_attention"])
+    out["slot_div"] = slot_diversity_loss(aux.slots)
     out["logit_norm"] = logits.float().pow(2).mean()
     return out
 
@@ -147,13 +411,15 @@ def train_epoch(model, loader, opt, scaler, device, dtype, args, epoch: int, flo
         y = y.to(device, non_blocking=True)
         opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.split(":")[0], dtype=dtype, enabled=use_amp):
-            logits, aux, _haux = model(wav)
+            logits, aux, haux = model(wav)
             ce = F.cross_entropy(logits.float(), y)
-            losses = aux_losses(logits, aux, args, flow_targets, skill_weights)
+            losses = aux_losses(logits, aux, haux, args, flow_targets, skill_weights)
             loss = ce
             loss = loss + args.lambda_skill * losses["skill"]
             loss = loss + args.lambda_write_budget * losses["write_budget"]
             loss = loss + args.lambda_update_alive * losses["update_alive"]
+            loss = loss + args.lambda_class_read_div * losses["class_read_div"]
+            loss = loss + args.lambda_slot_div * losses["slot_div"]
             loss = loss + args.lambda_logit_norm * losses["logit_norm"]
         if not torch.isfinite(loss):
             print("NONFINITE_LOSS skip", flush=True)
@@ -195,7 +461,7 @@ def evaluate(model, loader, device, dtype, args, flow_targets, skill_weights):
         with torch.autocast(device_type=device.split(":")[0], dtype=dtype, enabled=use_amp):
             logits, aux, haux = model(wav)
             ce = F.cross_entropy(logits.float(), y)
-            losses = aux_losses(logits, aux, args, flow_targets, skill_weights)
+            losses = aux_losses(logits, aux, haux, args, flow_targets, skill_weights)
             loss = ce + args.lambda_skill * losses["skill"]
         pred = logits.argmax(-1)
         bs = y.numel()
@@ -229,16 +495,24 @@ def run(args) -> None:
     model = AudioAssemblerModel(len(classes), args).to(device)
     if args.assembler_checkpoint:
         ckpt = torch.load(args.assembler_checkpoint, map_location=device)
-        state = ckpt.get("assembler_core", ckpt.get("core", ckpt))
+        state = _extract_core_state(ckpt)
         missing, unexpected = model.assembler_core.load_state_dict(state, strict=False)
         print(f"loaded assembler checkpoint: {args.assembler_checkpoint} missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+        ctx_state = _extract_task_context_state(ckpt)
+        if ctx_state and hasattr(model, "task_context"):
+            miss_ctx, unexp_ctx = model.task_context.load_state_dict(ctx_state, strict=False)
+            print(f"loaded task_context from assembler checkpoint missing={len(miss_ctx)} unexpected={len(unexp_ctx)}", flush=True)
+        mech_state = _extract_mechanism_builder_state(ckpt)
+        if mech_state and model.mechanism_builder is not None:
+            miss_mech, unexp_mech = model.mechanism_builder.load_state_dict(mech_state, strict=False)
+            print(f"loaded mechanism_builder from assembler checkpoint missing={len(miss_mech)} unexpected={len(unexp_mech)}", flush=True)
     if args.init_checkpoint:
         ckpt = torch.load(args.init_checkpoint, map_location=device)
         state = ckpt.get("model", ckpt)
         missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"loaded full task checkpoint: {args.init_checkpoint} missing={len(missing)} unexpected={len(unexpected)}", flush=True)
 
-    configure_train_mode(model, args.train_mode, args.train_input_adapter, args.train_head)
+    configure_train_mode(model, args.train_mode, args.train_input_adapter, args.train_head, args.train_task_context)
     summary = trainable_summary(model)
     print(f"loaded datasets: train={len(train_loader.dataset)} val={len(val_loader.dataset)} classes={classes}", flush=True)
     print(f"AudioAssemblerModel params={summary} mode={args.train_mode} device={device} amp={args.amp}", flush=True)
@@ -250,7 +524,7 @@ def run(args) -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=device.startswith("cuda") and dtype == torch.float16)
 
     cfg = model.assembler_core.cfg
-    flow_targets = build_flow_targets(cfg, torch.device(device))
+    flow_targets = make_runtime_flow_targets(args, cfg, torch.device(device))
     skill_weights = {
         "read_flow_kl": args.w_read,
         "primitive_slot_kl": args.w_primitive,
@@ -263,7 +537,7 @@ def run(args) -> None:
     fields = [
         "epoch", "train_loss", "train_ce", "train_acc", "val_loss", "val_acc", "best_acc",
         "skill", "read_flow_kl", "primitive_slot_kl", "slot_transition_kl", "primitive_transition_kl", "slot_composition_kl", "write_flow_kl",
-        "write_budget", "update_alive", "logit_norm",
+        "write_budget", "update_alive", "class_read_div", "slot_div", "logit_norm",
     ]
     with (out_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=fields).writeheader()
@@ -366,9 +640,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--grad-clip", type=float, default=0.75)
     p.add_argument("--write-target", type=float, default=0.44)
     p.add_argument("--min-update-norm", type=float, default=0.20)
-    p.add_argument("--lambda-skill", type=float, default=0.05)
+    p.add_argument("--lambda-skill", type=float, default=0.0)
     p.add_argument("--lambda-write-budget", type=float, default=0.025)
     p.add_argument("--lambda-update-alive", type=float, default=0.005)
+    p.add_argument("--lambda-class-read-div", type=float, default=0.020)
+    p.add_argument("--lambda-slot-div", type=float, default=0.002)
     p.add_argument("--lambda-logit-norm", type=float, default=0.0007)
     p.add_argument("--w-read", type=float, default=0.25)
     p.add_argument("--w-primitive", type=float, default=0.30)
@@ -385,9 +661,17 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--out-dir", default="./matrix_program_core/runs/audio_assembler")
     p.add_argument("--assembler-checkpoint", default="")
     p.add_argument("--init-checkpoint", default="")
-    p.add_argument("--train-mode", choices=["freeze_core", "delta", "full"], default="delta")
+    p.add_argument("--skill-target-pack", default="")
+    p.add_argument("--use-prior-skill-targets", action="store_true")
+    p.add_argument("--train-mode", choices=["freeze_core", "editor_delta", "delta", "full"], default="delta")
+    p.add_argument("--task-context-tokens", type=int, default=4)
+    p.add_argument("--head-context-tokens", type=int, default=10)
+    p.add_argument("--use-head-context", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--use-mechanism-context", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--mechanism-task-id", type=int, default=4)
     p.add_argument("--train-input-adapter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--train-head", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--train-task-context", action=argparse.BooleanOptionalAction, default=True)
     return p
 
 

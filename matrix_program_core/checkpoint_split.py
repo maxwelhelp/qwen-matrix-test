@@ -40,6 +40,7 @@ DELTA_MARKERS = (
 TASK_SPECIFIC_PREFIXES = (
     "input_adapter.",
     "head.",
+    "mechanism_adapter.",
     "context_norm.",
     "task_context_tokens",
     "head_context_tokens",
@@ -112,6 +113,13 @@ def get_context_base_state(ckpt: Dict) -> Dict[str, torch.Tensor]:
     return {}
 
 
+def get_mechanism_base_state(ckpt: Dict) -> Dict[str, torch.Tensor]:
+    mech = ckpt.get("mechanism_evidence_builder")
+    if isinstance(mech, dict):
+        return prefixed_state("mechanism_evidence_builder", mech)
+    return {}
+
+
 def get_context_task_state(ckpt: Dict) -> Dict[str, torch.Tensor]:
     """Return live task context state from full model checkpoints.
 
@@ -162,8 +170,10 @@ def export_split(input_path: str | Path, out_dir: str | Path, tag: str = "") -> 
     core = get_core_state(ckpt)
     base, delta = split_core_base_delta(core)
     context_base = get_context_base_state(ckpt)
+    mechanism_base = get_mechanism_base_state(ckpt)
     base_with_context = dict(base)
     base_with_context.update(context_base)
+    base_with_context.update(mechanism_base)
     task_state = split_model_task_state(ckpt)
     meta = meta_from_ckpt(ckpt)
     meta["source_checkpoint"] = str(input_path)
@@ -178,6 +188,7 @@ def export_split(input_path: str | Path, out_dir: str | Path, tag: str = "") -> 
     torch.save({
         "assembler_skill_base": base,
         "task_context_base": context_base,
+        "mechanism_context_base": mechanism_base,
         "meta": meta,
         "param_count": count_params(base_with_context),
     }, base_path)
@@ -200,11 +211,13 @@ def export_split(input_path: str | Path, out_dir: str | Path, tag: str = "") -> 
         "task_path": str(task_path),
         "base_params": count_params(base),
         "context_base_params": count_params(context_base),
+        "mechanism_base_params": count_params(mechanism_base),
         "base_plus_context_params": count_params(base_with_context),
         "delta_params": count_params(delta),
         "task_params": count_params(task_state),
         "base_keys": len(base),
         "context_base_keys": len(context_base),
+        "mechanism_base_keys": len(mechanism_base),
         "delta_keys": len(delta),
         "task_keys": len(task_state),
         "meta": meta,

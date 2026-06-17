@@ -88,6 +88,193 @@ def _entropy(p: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return -(p * p.log()).sum(dim=dim)
 
 
+class MatrixButterflyAttention(nn.Module):
+    """Factorized matrix attention over address cells.
+
+    This is intentionally inside the assembler core, not an external adapter.
+    It lets state/memory/global cells exchange information before read,
+    primitive, transition, composition, and write matrices are chosen.
+    """
+
+    def __init__(self, dim: int, address_cells: int, heads: int = 4, rank: int = 8, dropout: float = 0.04):
+        super().__init__()
+        self.D = int(dim)
+        self.A = int(address_cells)
+        self.H = max(1, int(heads))
+        self.R = max(4, int(rank))
+        self.inner = self.H * self.R
+        self.q = nn.Linear(self.D, self.inner, bias=False)
+        self.k = nn.Linear(self.D, self.inner, bias=False)
+        self.v = nn.Linear(self.D, self.inner, bias=False)
+        self.out = nn.Linear(self.inner, self.D, bias=False)
+        self.out_delta = nn.Linear(self.inner, self.D, bias=False)
+        self.addr_left = nn.Parameter(torch.randn(self.H, self.A, self.R) * 0.02)
+        self.addr_right = nn.Parameter(torch.randn(self.H, self.R, self.A) * 0.02)
+        self.score_delta = nn.Parameter(torch.zeros(self.H, self.A, self.A))
+        self.channel = ChannelButterfly(self.D, 2)
+        self.gate = nn.Linear(self.D, self.D)
+        self.norm = nn.LayerNorm(self.D)
+        self.drop = nn.Dropout(dropout)
+        nn.init.zeros_(self.out_delta.weight)
+        nn.init.constant_(self.gate.bias, -2.2)
+
+    def forward(self, cells: torch.Tensor, use_deltas: bool = True) -> torch.Tensor:
+        N, A, D = cells.shape
+        q = self.q(cells).view(N, A, self.H, self.R).transpose(1, 2)
+        k = self.k(cells).view(N, A, self.H, self.R).transpose(1, 2)
+        v = self.v(cells).view(N, A, self.H, self.R).transpose(1, 2)
+        score = torch.einsum("nhar,nhbr->nhab", q, k) / math.sqrt(self.R)
+        addr = torch.matmul(self.addr_left, self.addr_right) / math.sqrt(self.R)
+        score = score + addr.to(device=cells.device, dtype=score.dtype).unsqueeze(0)
+        if use_deltas:
+            score = score + self.score_delta.to(device=cells.device, dtype=score.dtype).unsqueeze(0)
+        attn = torch.softmax(score.float(), dim=-1).to(cells.dtype)
+        mixed = torch.einsum("nhab,nhbr->nhar", attn, v).transpose(1, 2).reshape(N, A, self.inner)
+        upd = self.out(mixed)
+        if use_deltas:
+            upd = upd + self.out_delta(mixed)
+        upd = self.channel(upd)
+        gate = torch.sigmoid(self.gate(cells.float())).to(cells.dtype)
+        return self.norm(cells + gate * self.drop(upd.to(cells.dtype)))
+
+
+class ProjectedVariantEditor(nn.Module):
+    """Parallel low-rank edit variants with differentiable quality blending."""
+
+    def __init__(self, dim: int, out_dim: int, variants: int = 4, rank: int = 8, max_scale: float = 0.20):
+        super().__init__()
+        self.D = int(dim)
+        self.O = int(out_dim)
+        self.V = max(2, int(variants))
+        self.R = max(4, int(rank))
+        self.max_scale = float(max_scale)
+        self.quality = nn.Linear(self.D, self.V, bias=True)
+        self.down = nn.Linear(self.D, self.V * self.R, bias=False)
+        self.up = nn.Parameter(torch.zeros(self.V, self.R, self.O))
+        self.up_delta = nn.Parameter(torch.zeros(self.V, self.R, self.O))
+        self.gate = nn.Linear(self.D, 1, bias=True)
+        self.gate_delta = nn.Linear(self.D, 1, bias=False)
+        nn.init.zeros_(self.quality.weight)
+        nn.init.zeros_(self.quality.bias)
+        nn.init.normal_(self.down.weight, mean=0.0, std=0.02)
+        nn.init.constant_(self.gate.bias, -3.0)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate_delta.weight)
+
+    def forward(self, token: torch.Tensor, use_deltas: bool = True) -> torch.Tensor:
+        token_f = token.float()
+        quality = torch.softmax(self.quality(token_f), dim=-1)
+        z = self.down(token_f).view(token.shape[0], self.V, self.R)
+        up = self.up
+        if use_deltas:
+            up = up + self.up_delta
+        variants = torch.einsum("nvr,vro->nvo", z, up.float())
+        edit = torch.einsum("nv,nvo->no", quality, variants)
+        gate_logits = self.gate(token_f)
+        if use_deltas:
+            gate_logits = gate_logits + self.gate_delta(token_f)
+        gate = self.max_scale * torch.sigmoid(gate_logits)
+        return (gate * edit).to(token.dtype)
+
+
+class FlowEditAttention(nn.Module):
+    """Small differentiable editor for flow logits.
+
+    It does not choose a path. It proposes bounded residual edits for every
+    read/primitive/operator/write matrix before softmax. The base program stays
+    intact; the editor can softly add missing mass or move mass away from weak
+    choices when gradients indicate that is useful.
+    """
+
+    def __init__(self, dim: int, blocks: int, slots: int, address_cells: int, primitive_count: int, rank: int = 16, dropout: float = 0.04):
+        super().__init__()
+        self.D = int(dim)
+        self.B = int(blocks)
+        self.K = int(slots)
+        self.A = int(address_cells)
+        self.P = int(primitive_count)
+        self.M = 6
+        self.R = max(8, int(rank))
+        self.mechanism_embed = nn.Parameter(torch.randn(self.M, self.D) * 0.02)
+        self.ctx = nn.Linear(self.D * 3, self.D)
+        self.q = nn.Linear(self.D, self.R, bias=False)
+        self.k = nn.Linear(self.D, self.R, bias=False)
+        self.v = nn.Linear(self.D, self.R, bias=False)
+        self.o = nn.Linear(self.R, self.D, bias=False)
+        self.relation_left = nn.Parameter(torch.randn(self.M, self.R) * 0.02)
+        self.relation_right = nn.Parameter(torch.randn(self.R, self.M) * 0.02)
+        self.scale_logit = nn.Parameter(torch.full((self.M,), -3.0))
+        self.scale_delta = nn.Parameter(torch.zeros(self.M))
+        self.out = nn.ModuleDict({
+            "read": nn.Linear(self.D, self.B * self.K * self.A, bias=False),
+            "primitive": nn.Linear(self.D, self.B * self.K * self.P, bias=False),
+            "slot_transition": nn.Linear(self.D, self.B * self.K * self.K, bias=False),
+            "primitive_transition": nn.Linear(self.D, self.P * self.P, bias=False),
+            "composition": nn.Linear(self.D, self.B * self.K, bias=False),
+            "write": nn.Linear(self.D, self.B * self.A, bias=False),
+        })
+        self.out_delta = nn.ModuleDict({
+            "read": nn.Linear(self.D, self.B * self.K * self.A, bias=False),
+            "primitive": nn.Linear(self.D, self.B * self.K * self.P, bias=False),
+            "slot_transition": nn.Linear(self.D, self.B * self.K * self.K, bias=False),
+            "primitive_transition": nn.Linear(self.D, self.P * self.P, bias=False),
+            "composition": nn.Linear(self.D, self.B * self.K, bias=False),
+            "write": nn.Linear(self.D, self.B * self.A, bias=False),
+        })
+        self.variant_editors = nn.ModuleDict({
+            "primitive": ProjectedVariantEditor(self.D, self.B * self.K * self.P, variants=5, rank=max(4, self.R // 2), max_scale=0.18),
+            "slot_transition": ProjectedVariantEditor(self.D, self.B * self.K * self.K, variants=4, rank=max(4, self.R // 2), max_scale=0.14),
+            "primitive_transition": ProjectedVariantEditor(self.D, self.P * self.P, variants=5, rank=max(4, self.R // 2), max_scale=0.18),
+        })
+        self.norm = nn.LayerNorm(self.D)
+        self.drop = nn.Dropout(dropout)
+        for mod in list(self.out.values()) + list(self.out_delta.values()):
+            nn.init.zeros_(mod.weight)
+
+    def _context(self, cells: torch.Tensor) -> torch.Tensor:
+        state = cells[:, : self.B].mean(dim=1)
+        memory = cells[:, self.B:].mean(dim=1) if cells.shape[1] > self.B else torch.zeros_like(state)
+        global_ctx = cells.mean(dim=1)
+        return self.ctx(torch.cat([state, memory, global_ctx], dim=-1).float()).to(cells.dtype)
+
+    def forward(self, cells: torch.Tensor, use_deltas: bool = True):
+        N = int(cells.shape[0])
+        base = self._context(cells).unsqueeze(1) + self.mechanism_embed.to(device=cells.device, dtype=cells.dtype).unsqueeze(0)
+        q = self.q(base.float())
+        k = self.k(base.float())
+        v = self.v(base.float())
+        score = torch.einsum("bir,bjr->bij", q, k) / math.sqrt(self.R)
+        relation = torch.matmul(self.relation_left, self.relation_right) / math.sqrt(self.R)
+        score = score + relation.to(device=cells.device, dtype=score.dtype).unsqueeze(0)
+        attn = torch.softmax(score, dim=-1).to(cells.dtype)
+        mix = torch.einsum("bij,bjr->bir", attn, v.to(cells.dtype))
+        token = self.norm(base + self.drop(self.o(mix.float()).to(cells.dtype)))
+        scale_logits = self.scale_logit
+        if use_deltas:
+            scale_logits = scale_logits + self.scale_delta
+        scale = (0.20 * torch.sigmoid(scale_logits.float())).to(device=cells.device, dtype=cells.dtype).view(1, self.M, 1)
+        token = token * scale
+
+        names = ("read", "primitive", "slot_transition", "primitive_transition", "composition", "write")
+        flat = []
+        for i, name in enumerate(names):
+            x = self.out[name](token[:, i].float())
+            if use_deltas:
+                x = x + self.out_delta[name](token[:, i].float())
+            if name in self.variant_editors:
+                x = x + self.variant_editors[name](token[:, i], use_deltas=use_deltas).float()
+            flat.append(x.to(cells.dtype))
+        r, p, st, pt, comp, wr = flat
+        return (
+            r.view(N, self.B, self.K, self.A),
+            p.view(N, self.B, self.K, self.P),
+            st.view(N, self.B, self.K, self.K),
+            pt.view(N, self.P, self.P),
+            comp.view(N, self.B, self.K),
+            wr.view(N, self.B, self.A),
+        )
+
+
 class AssemblerStep(nn.Module):
     """One factorized matrix-program assembly step.
 
@@ -117,6 +304,18 @@ class AssemblerStep(nn.Module):
         self.gate_h = nn.Parameter(torch.randn(self.D, self.D) * 0.02)
         self.gate_c = nn.Parameter(torch.randn(self.D, self.D) * 0.02)
         self.gate_bias = nn.Parameter(torch.full((self.D,), -0.35))
+        self.layer_step_key = nn.Parameter(torch.randn(self.D) * 0.02)
+        phase_logits = torch.full((len(PHASES),), -0.65)
+        phase_logits[min(layer, len(PHASES) - 1)] = 1.25
+        self.phase_mix_logits = nn.Parameter(phase_logits)
+        self.phase_mix_delta = nn.Parameter(torch.zeros(len(PHASES)))
+        self.matrix_attention = MatrixButterflyAttention(
+            self.D,
+            self.A,
+            heads=4,
+            rank=max(8, self.D // 8),
+            dropout=cfg.dropout,
+        )
 
         # Base assembly matrices.
         self.read_logits = nn.Parameter(self._read_prior())                     # [B,K,A]
@@ -126,6 +325,32 @@ class AssemblerStep(nn.Module):
         self.slot_composition_logits = nn.Parameter(torch.zeros(self.B, self.K)) # [B,K]
         self.write_logits = nn.Parameter(self._write_prior())                   # [B,A]
         self.write_gate_logit = nn.Parameter(torch.full((self.B,), -0.15))
+
+        # Context-conditioned dense soft-flow. This lets the same assembler core
+        # choose different valid matrix programs for different evidence/cell states
+        # without discrete routing. The base projection is learned in pretrain;
+        # ctx_flow_delta is LoRA-like and trainable in delta mode.
+        self.flow_context_size = (
+            self.B * self.K * self.A
+            + self.B * self.K * self.P
+            + self.B * self.K * self.K
+            + self.P * self.P
+            + self.B * self.K
+            + self.B * self.A
+        )
+        self.ctx_flow = nn.Linear(self.D, self.flow_context_size, bias=False)
+        self.ctx_flow_delta = nn.Linear(self.D, self.flow_context_size, bias=False)
+        nn.init.zeros_(self.ctx_flow.weight)
+        nn.init.zeros_(self.ctx_flow_delta.weight)
+        self.flow_editor = FlowEditAttention(
+            self.D,
+            self.B,
+            self.K,
+            self.A,
+            self.P,
+            rank=max(8, self.D // 6),
+            dropout=cfg.dropout,
+        )
 
         # LoRA-like task deltas. In delta mode only these are trainable.
         self.read_delta = nn.Parameter(torch.zeros(self.B, self.K, self.A))
@@ -226,6 +451,43 @@ class AssemblerStep(nn.Module):
     def _eff(self, base: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
         return base + delta if self.cfg.use_deltas else base
 
+    def _context_flow_bias(self, cells: torch.Tensor):
+        # cells: [N,A,D] -> per-example additive logits for all flow matrices.
+        state_ctx = cells[:, : self.B].mean(dim=1)
+        mem0 = self.B
+        glob0 = self.B + int(self.cfg.memory_cells)
+        if int(self.cfg.memory_cells) > 0:
+            memory_ctx = cells[:, mem0:glob0].mean(dim=1)
+        else:
+            memory_ctx = torch.zeros_like(state_ctx)
+        if int(self.cfg.global_cells) > 0:
+            global_ctx = cells[:, glob0:].mean(dim=1)
+        else:
+            global_ctx = torch.zeros_like(state_ctx)
+        # Explicit layer/step key tells the assembler where it is in the program grid.
+        ctx = (state_ctx + 0.7 * memory_ctx + 0.7 * global_ctx + self.layer_step_key.to(device=cells.device, dtype=cells.dtype).view(1, -1)).float()
+        flat = self.ctx_flow(ctx)
+        if self.cfg.use_deltas:
+            flat = flat + self.ctx_flow_delta(ctx)
+        flat = flat.to(device=cells.device, dtype=cells.dtype)
+        sizes = [
+            self.B * self.K * self.A,
+            self.B * self.K * self.P,
+            self.B * self.K * self.K,
+            self.P * self.P,
+            self.B * self.K,
+            self.B * self.A,
+        ]
+        r, ps, st, pt, comp, wr = torch.split(flat, sizes, dim=-1)
+        return (
+            r.view(cells.shape[0], self.B, self.K, self.A),
+            ps.view(cells.shape[0], self.B, self.K, self.P),
+            st.view(cells.shape[0], self.B, self.K, self.K),
+            pt.view(cells.shape[0], self.P, self.P),
+            comp.view(cells.shape[0], self.B, self.K),
+            wr.view(cells.shape[0], self.B, self.A),
+        )
+
     def _primitive_outputs(self, read_ctx: torch.Tensor) -> torch.Tensor:
         # read_ctx: [N,B,K,D] -> [N,B,K,P,D]
         N, B, K, D = read_ctx.shape
@@ -245,20 +507,22 @@ class AssemblerStep(nn.Module):
             + ctx_m @ self.gate_c.to(device=read_ctx.device, dtype=read_ctx.dtype)
             + self.gate_bias.to(device=read_ctx.device, dtype=read_ctx.dtype)
         )
-        if self.phase == "extract":
-            phase = channel + 0.50 * ctx_m
-        elif self.phase == "compare":
-            phase = channel - low
-        elif self.phase == "suppress":
-            phase = -gate * block.mean(dim=1, keepdim=True)
-        elif self.phase == "aggregate":
-            phase = block + read_ctx.mean(dim=1, keepdim=True)
-        else:
-            phase = channel
+        phase_candidates = torch.stack([
+            channel + 0.50 * ctx_m,
+            channel - low,
+            -gate * block.mean(dim=1, keepdim=True),
+            block + read_ctx.mean(dim=1, keepdim=True),
+        ], dim=3)
+        phase_logits = self.phase_mix_logits
+        if self.cfg.use_deltas:
+            phase_logits = phase_logits + self.phase_mix_delta
+        phase_w = torch.softmax(phase_logits.float(), dim=-1).to(read_ctx.dtype)
+        phase = torch.einsum("f,nbkfd->nbkd", phase_w, phase_candidates)
         return torch.stack([channel, block, low, ctx_m, product, phase], dim=3)
 
     def forward(self, cells: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         # cells: [N,A,D]
+        cells = self.matrix_attention(cells, use_deltas=self.cfg.use_deltas)
         read_logits = self._eff(self.read_logits, self.read_delta)
         prim_logits = self._eff(self.primitive_slot_logits, self.primitive_slot_delta)
         slot_trans_logits = self._eff(self.slot_transition_logits, self.slot_transition_delta)
@@ -266,35 +530,37 @@ class AssemblerStep(nn.Module):
         comp_logits = self._eff(self.slot_composition_logits, self.slot_composition_delta)
         write_logits = self._eff(self.write_logits, self.write_delta)
 
-        read_w = torch.softmax(read_logits.float(), dim=-1).to(cells.dtype)        # [B,K,A]
-        prim_w = torch.softmax(prim_logits.float(), dim=-1).to(cells.dtype)        # [B,K,P]
-        slot_trans = torch.softmax(slot_trans_logits.float(), dim=-1).to(cells.dtype) # [B,K,K]
-        prim_trans = torch.softmax(prim_trans_logits.float(), dim=-1).to(cells.dtype) # [P,P]
-        comp_w = torch.softmax(comp_logits.float(), dim=-1).to(cells.dtype)        # [B,K]
-        write_w = torch.softmax(write_logits.float(), dim=-1).to(cells.dtype)      # [B,A]
+        read_b, prim_b, slot_b, ptrans_b, comp_b, write_b = self._context_flow_bias(cells)
+        read_e, prim_e, slot_e, ptrans_e, comp_e, write_e = self.flow_editor(cells, use_deltas=self.cfg.use_deltas)
+        read_w = torch.softmax(read_logits.float().unsqueeze(0) + read_b.float() + read_e.float(), dim=-1).to(cells.dtype)        # [N,B,K,A]
+        prim_w = torch.softmax(prim_logits.float().unsqueeze(0) + prim_b.float() + prim_e.float(), dim=-1).to(cells.dtype)        # [N,B,K,P]
+        slot_trans = torch.softmax(slot_trans_logits.float().unsqueeze(0) + slot_b.float() + slot_e.float(), dim=-1).to(cells.dtype) # [N,B,K,K]
+        prim_trans = torch.softmax(prim_trans_logits.float().unsqueeze(0) + ptrans_b.float() + ptrans_e.float(), dim=-1).to(cells.dtype) # [N,P,P]
+        comp_w = torch.softmax(comp_logits.float().unsqueeze(0) + comp_b.float() + comp_e.float(), dim=-1).to(cells.dtype)        # [N,B,K]
+        write_w = torch.softmax(write_logits.float().unsqueeze(0) + write_b.float() + write_e.float(), dim=-1).to(cells.dtype)      # [N,B,A]
 
-        read_ctx = torch.einsum("bka,nad->nbkd", read_w, cells)                   # [N,B,K,D]
+        read_ctx = torch.einsum("nbka,nad->nbkd", read_w, cells)                   # [N,B,K,D]
         prim_out = self._primitive_outputs(read_ctx)                               # [N,B,K,P,D]
 
         # Factorized transitions: primitive type transition and slot transition.
-        prim_mixed = torch.einsum("pq,nbkqd->nbkpd", prim_trans, prim_out)        # [N,B,K,P,D]
-        slot_mixed = torch.einsum("bkj,nbjpd->nbkpd", slot_trans, prim_mixed)     # [N,B,K,P,D]
+        prim_mixed = torch.einsum("npq,nbkqd->nbkpd", prim_trans, prim_out)        # [N,B,K,P,D]
+        slot_mixed = torch.einsum("nbkj,nbjpd->nbkpd", slot_trans, prim_mixed)     # [N,B,K,P,D]
 
-        slot_val = torch.einsum("bkp,nbkpd->nbkd", prim_w, slot_mixed)             # [N,B,K,D]
-        update = torch.einsum("bk,nbkd->nbd", comp_w, slot_val)                   # [N,B,D]
+        slot_val = torch.einsum("nbkp,nbkpd->nbkd", prim_w, slot_mixed)             # [N,B,K,D]
+        update = torch.einsum("nbk,nbkd->nbd", comp_w, slot_val)                   # [N,B,D]
         update = self.norm(self.drop(update))
 
         write_gate = torch.sigmoid(self.write_gate_logit.to(device=cells.device, dtype=cells.dtype)).view(1, self.B, 1)
-        delta_cells = torch.einsum("ba,nbd->nad", write_w, write_gate * update)    # [N,A,D]
+        delta_cells = torch.einsum("nba,nbd->nad", write_w, write_gate * update)    # [N,A,D]
         next_cells = self.norm(cells + delta_cells)
 
         info = {
-            "read_flow": read_w.detach().float(),
-            "primitive_slot_flow": prim_w.detach().float(),
-            "slot_transition_flow": slot_trans.detach().float(),
-            "primitive_transition_flow": prim_trans.detach().float(),
-            "slot_composition_flow": comp_w.detach().float(),
-            "write_flow": write_w.detach().float(),
+            "read_flow": read_w.float(),
+            "primitive_slot_flow": prim_w.float(),
+            "slot_transition_flow": slot_trans.float(),
+            "primitive_transition_flow": prim_trans.float(),
+            "slot_composition_flow": comp_w.float(),
+            "write_flow": write_w.float(),
             "write_gates": write_gate.detach().float().squeeze(0).squeeze(-1),
             "update_norms": update.detach().float().norm(dim=-1),
             "slot_values": slot_val.detach(),
@@ -373,6 +639,16 @@ class MatrixProgramAssemblerCore(nn.Module):
         if mode == "freeze_core":
             for p in self.parameters():
                 p.requires_grad = False
+            return
+        if mode == "editor_delta":
+            self.set_delta_mode(True)
+            allowed = (
+                "flow_editor.scale_delta",
+                "flow_editor.variant_editors",
+                "phase_mix_delta",
+            )
+            for name, p in self.named_parameters():
+                p.requires_grad = name.endswith("_delta") and any(key in name for key in allowed)
             return
         if mode == "delta":
             self.set_delta_mode(True)
@@ -461,9 +737,18 @@ class MatrixProgramAssemblerCore(nn.Module):
 def flow_kl(pred: torch.Tensor, target: torch.Tensor, dim: int = -1) -> torch.Tensor:
     pred = pred.float()
     target = target.to(device=pred.device, dtype=pred.dtype)
+    # Targets are usually [T,...], while context-conditioned predictions are [T,N,...].
+    # Add broadcast dimensions after time until ranks match.
+    while target.ndim < pred.ndim:
+        target = target.unsqueeze(1)
     target = target / target.sum(dim=dim, keepdim=True).clamp_min(1e-8)
     pred = pred / pred.sum(dim=dim, keepdim=True).clamp_min(1e-8)
-    return F.kl_div(pred.clamp_min(1e-8).log(), target, reduction="batchmean")
+    target = target.expand_as(pred)
+    return F.kl_div(
+        pred.clamp_min(1e-8).log(),
+        target,
+        reduction="none",
+    ).sum(dim=dim).mean()
 
 
 def assembler_skill_loss(aux: AssemblerAux, targets: Dict[str, torch.Tensor], weights: Dict[str, float]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:

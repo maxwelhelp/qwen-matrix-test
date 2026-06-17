@@ -66,8 +66,25 @@ class TaskIOContextEncoder(nn.Module):
         self.norm = nn.LayerNorm(D)
         self.drop = nn.Dropout(cfg.dropout)
 
-    def _id_tensor(self, value: int, batch: int, device: torch.device) -> torch.Tensor:
+    def _id_tensor(self, value, batch: int, device: torch.device) -> torch.Tensor:
+        if torch.is_tensor(value):
+            v = value.to(device=device, dtype=torch.long).view(-1)
+            if v.numel() == 1:
+                return v.expand(batch)
+            if v.numel() != batch:
+                raise ValueError(f"context id tensor has {v.numel()} items, expected {batch}")
+            return v
         return torch.full((batch,), int(value), device=device, dtype=torch.long)
+
+    def _num_tensor(self, value, batch: int, device: torch.device, default: float = 0.0) -> torch.Tensor:
+        if torch.is_tensor(value):
+            v = value.to(device=device, dtype=torch.float32).view(-1)
+            if v.numel() == 1:
+                return v.expand(batch)
+            if v.numel() != batch:
+                raise ValueError(f"context numeric tensor has {v.numel()} items, expected {batch}")
+            return v
+        return torch.full((batch,), float(value if value is not None else default), device=device, dtype=torch.float32)
 
     def forward(
         self,
@@ -92,11 +109,12 @@ class TaskIOContextEncoder(nn.Module):
         out = self.output_kind(self._id_tensor(output_kind_id, B, device)).unsqueeze(1)
         loss = self.loss_kind(self._id_tensor(loss_kind_id, B, device)).unsqueeze(1)
         readout = self.readout_kind(self._id_tensor(readout_kind_id, B, device)).unsqueeze(1)
-        nums = torch.tensor(
-            [float(num_outputs), float(sequence_length), float(hidden_dim), float(extra_scalar)],
-            device=device,
-            dtype=torch.float32,
-        ).view(1, 4).expand(B, 4)
+        nums = torch.stack([
+            self._num_tensor(num_outputs, B, device, 1.0),
+            self._num_tensor(sequence_length, B, device, 1.0),
+            self._num_tensor(hidden_dim, B, device, 1.0),
+            self._num_tensor(extra_scalar, B, device, 0.0),
+        ], dim=-1)
         # log scale keeps dimensions/counts from dominating.
         nums = torch.log1p(nums.clamp_min(0.0))
         num_tok = self.numeric_proj(nums).unsqueeze(1)

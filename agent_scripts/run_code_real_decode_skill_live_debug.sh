@@ -4,9 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-bash agent_scripts/patch_assembler_context_softflow.sh
-bash agent_scripts/patch_task_context_v2_force.sh
-bash agent_scripts/patch_task_context_batch_and_load.sh
+APPLY_PATCHES="${APPLY_PATCHES:-0}"
+if [[ "$APPLY_PATCHES" == "1" ]]; then
+  bash agent_scripts/patch_assembler_context_softflow.sh
+  bash agent_scripts/patch_task_context_v2_force.sh
+  bash agent_scripts/patch_task_context_batch_and_load.sh
+fi
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 REPORT_DIR="agent_reports/code_real_decode_skill_live_${STAMP}"
@@ -29,42 +32,74 @@ AUDIO_MODES="${AUDIO_MODES:-delta freeze_core full}"
 N_CODE="${N_CODE:-4000}"
 LOG_EVERY="${LOG_EVERY:-50}"
 AUDIO_LAMBDA_SKILL="${AUDIO_LAMBDA_SKILL:-0.001}"
-PARSE_DIRS="${PARSE_DIRS:-simple_butterfly_matrix_v4 matrix_program_core}"
+TRAIN_TASK_CONTEXT="${TRAIN_TASK_CONTEXT:-1}"
+AMP_SKILL="${AMP_SKILL:-fp32}"
+AMP_AUDIO="${AMP_AUDIO:-fp32}"
+PARSE_DIRS="${PARSE_DIRS:-matrix_program_core simple_butterfly_matrix_v3 simple_butterfly_matrix}"
 MAX_PARSE_FILES="${MAX_PARSE_FILES:-96}"
 CHECKPOINTS="${CHECKPOINTS:-}"
 CHECKPOINT_DIRS="${CHECKPOINT_DIRS:-}"
 MAX_MATRICES="${MAX_MATRICES:-128}"
+CACHE_ROOT="${CACHE_ROOT:-matrix_program_core/cache/code_real_decode}"
+FORCE_REBUILD_CODE_CACHE="${FORCE_REBUILD_CODE_CACHE:-0}"
+CODE_PACK_OVERRIDE="${CODE_PACK_OVERRIDE:-}"
+SKILL_CKPT_OVERRIDE="${SKILL_CKPT_OVERRIDE:-}"
 
 printf '\n[code-real] repo=%s\n' "$ROOT"
 printf '[code-real] report_dir=%s\n' "$REPORT_DIR"
 printf '[code-real] parse_dirs=%s checkpoints=%s checkpoint_dirs=%s\n' "$PARSE_DIRS" "$CHECKPOINTS" "$CHECKPOINT_DIRS"
 printf '[code-real] skill_epochs=%s audio_epochs=%s modes=%s n_code=%s\n\n' "$EPOCHS_SKILL" "$EPOCHS_AUDIO" "$AUDIO_MODES" "$N_CODE"
+TASK_CONTEXT_FLAG="--train-task-context"
+if [[ "$TRAIN_TASK_CONTEXT" == "0" ]]; then
+  TASK_CONTEXT_FLAG="--no-train-task-context"
+fi
 
 git rev-parse --short HEAD 2>/dev/null | sed 's/^/[code-real] git_head=/' || true
 
-printf '\n[code-real] build code-context flow pack\n'
-# shellcheck disable=SC2086
-python matrix_program_core/train_assembler_code_context_pretrain.py \
-  --old-v3-path neural_matrix_program_dataset_v3/neural_matrix_program_dataset_v3.py \
-  --parse-dirs $PARSE_DIRS \
-  --max-parse-files "$MAX_PARSE_FILES" \
-  --out-dir "$WORK/code_only_build" \
-  --device cuda \
-  --amp bf16 \
-  --n "$N_CODE" \
-  --epochs 0 \
-  --log-every "$LOG_EVERY" || true
-CODE_PACK="$WORK/code_only_build/code_context_dataset.pt"
-if [[ ! -f "$CODE_PACK" ]]; then
-  echo "[code-real][WARN] code pack was not created by epochs=0 path; rebuilding with 1 dry epoch small" >&2
-  # shellcheck disable=SC2086
-  python matrix_program_core/train_assembler_code_context_pretrain.py \
-    --old-v3-path neural_matrix_program_dataset_v3/neural_matrix_program_dataset_v3.py \
-    --parse-dirs $PARSE_DIRS \
-    --max-parse-files "$MAX_PARSE_FILES" \
-    --out-dir "$WORK/code_only_build" \
-    --device cuda --amp bf16 --n "$N_CODE" --epochs 1 --log-every "$LOG_EVERY"
+mkdir -p "$CACHE_ROOT"
+if [[ -n "$CODE_PACK_OVERRIDE" ]]; then
+  CODE_PACK="$CODE_PACK_OVERRIDE"
+  CODE_CACHE_DIR="$(dirname "$CODE_PACK")"
+  printf '\n[code-real] using CODE_PACK_OVERRIDE=%s\n' "$CODE_PACK"
+elif [[ -z "$CODE_PACK_OVERRIDE" ]]; then
+  CODE_CACHE_KEY="$(
+  python - "$PARSE_DIRS" "$MAX_PARSE_FILES" "$N_CODE" "$AMP_SKILL" <<'PY'
+import hashlib, sys
+print(hashlib.sha1("\n".join(sys.argv[1:]).encode("utf-8")).hexdigest()[:16])
+PY
+)"
+  CODE_CACHE_DIR="$CACHE_ROOT/code_${CODE_CACHE_KEY}"
+  CODE_PACK="$CODE_CACHE_DIR/code_context_dataset.pt"
+  printf '\n[code-real] code cache key=%s path=%s\n' "$CODE_CACHE_KEY" "$CODE_PACK"
+  if [[ "$FORCE_REBUILD_CODE_CACHE" == "1" || ! -f "$CODE_PACK" ]]; then
+    printf '\n[code-real] build code-context flow pack\n'
+    mkdir -p "$CODE_CACHE_DIR"
+    # shellcheck disable=SC2086
+    python matrix_program_core/train_assembler_code_context_pretrain.py \
+      --old-v3-path neural_matrix_program_dataset_v3/neural_matrix_program_dataset_v3.py \
+      --parse-dirs $PARSE_DIRS \
+      --max-parse-files "$MAX_PARSE_FILES" \
+      --out-dir "$CODE_CACHE_DIR" \
+      --device cuda \
+      --amp "$AMP_SKILL" \
+      --n "$N_CODE" \
+      --epochs 0 \
+      --log-every "$LOG_EVERY" || true
+    if [[ ! -f "$CODE_PACK" ]]; then
+      echo "[code-real][WARN] code pack was not created by epochs=0 path; rebuilding with 1 dry epoch small" >&2
+      # shellcheck disable=SC2086
+      python matrix_program_core/train_assembler_code_context_pretrain.py \
+        --old-v3-path neural_matrix_program_dataset_v3/neural_matrix_program_dataset_v3.py \
+        --parse-dirs $PARSE_DIRS \
+        --max-parse-files "$MAX_PARSE_FILES" \
+        --out-dir "$CODE_CACHE_DIR" \
+        --device cuda --amp "$AMP_SKILL" --n "$N_CODE" --epochs 1 --log-every "$LOG_EVERY"
+    fi
+  else
+    printf '[code-real] reuse cached code-context flow pack\n'
+  fi
 fi
+cp "$CODE_CACHE_DIR/ast_summary.json" "$REPORT_DIR/code_context_ast_summary.json" 2>/dev/null || true
 
 REAL_PACK=""
 if [[ -n "$CHECKPOINTS$CHECKPOINT_DIRS" ]]; then
@@ -109,20 +144,24 @@ print(json.dumps(merged["meta"], ensure_ascii=False, indent=2))
 PY
 cp "$MERGED_PACK" "$REPORT_DIR/merged_flow_pack.meta.pt" 2>/dev/null || true
 
-printf '\n[code-real] train assembler skill on merged flow pack\n'
-python matrix_program_core/train_assembler_code_context_pretrain.py \
-  --dataset "$MERGED_PACK" \
-  --out-dir "$WORK/skill_train" \
-  --device cuda --amp bf16 \
-  --epochs "$EPOCHS_SKILL" \
-  --batch-size 128 --eval-batch-size 256 --workers 2 --pin-memory \
-  --lr 4e-4 --lambda-entropy-keep 0.01 --lambda-delta-l2 0.01 \
-  --log-every "$LOG_EVERY"
-
-SKILL_CKPT="$WORK/skill_train/assembler_code_context_best.pt"
+if [[ -n "$SKILL_CKPT_OVERRIDE" ]]; then
+  SKILL_CKPT="$SKILL_CKPT_OVERRIDE"
+  printf '\n[code-real] using SKILL_CKPT_OVERRIDE=%s\n' "$SKILL_CKPT"
+else
+  printf '\n[code-real] train assembler skill on merged flow pack\n'
+  python matrix_program_core/train_assembler_code_context_pretrain.py \
+    --dataset "$MERGED_PACK" \
+    --out-dir "$WORK/skill_train" \
+    --device cuda --amp "$AMP_SKILL" \
+    --epochs "$EPOCHS_SKILL" \
+    --batch-size 128 --eval-batch-size 256 --workers 2 --pin-memory \
+    --lr 4e-4 --lambda-entropy-keep 0.01 --lambda-delta-l2 0.01 \
+    --log-every "$LOG_EVERY"
+  SKILL_CKPT="$WORK/skill_train/assembler_code_context_best.pt"
+  cp "$WORK/skill_train/final_report.json" "$REPORT_DIR/skill_final_report.json" || true
+  cp "$WORK/skill_train/metrics.csv" "$REPORT_DIR/skill_metrics.csv" || true
+fi
 python matrix_program_core/checkpoint_split.py --input "$SKILL_CKPT" --out-dir "$EXPORT_ROOT" --tag code_real_skill
-cp "$WORK/skill_train/final_report.json" "$REPORT_DIR/skill_final_report.json" || true
-cp "$WORK/skill_train/metrics.csv" "$REPORT_DIR/skill_metrics.csv" || true
 
 for MODE in $AUDIO_MODES; do
   OUT="$AUDIO_ROOT/$MODE"
@@ -130,10 +169,12 @@ for MODE in $AUDIO_MODES; do
   python matrix_program_core/transfer_audio_assembler.py \
     --data-root ../architecture_builder/data/speechcommands \
     --assembler-checkpoint "$SKILL_CKPT" \
+    --skill-target-pack "$MERGED_PACK" \
     --out-dir "$OUT" \
     --train-mode "$MODE" \
     --task-context-tokens 4 --head-context-tokens 10 --use-head-context \
-    --device cuda --amp fp32 \
+    "$TASK_CONTEXT_FLAG" \
+    --device cuda --amp "$AMP_AUDIO" \
     --classes yes,no,up,down,left,right,on,off,stop,go \
     --train-limit 12000 --val-limit 2000 \
     --batch-size 128 --eval-batch-size 256 --workers 4 --pin-memory \
@@ -171,7 +212,7 @@ REPORT="$REPORT_DIR/REPORT_TO_CHATGPT.txt"
   echo
   echo "## git"; git rev-parse HEAD 2>/dev/null || true; git status --short 2>/dev/null || true
   echo
-  echo "## config"; echo "WORK=$WORK"; echo "CHECKPOINTS=$CHECKPOINTS"; echo "CHECKPOINT_DIRS=$CHECKPOINT_DIRS"; echo "PARSE_DIRS=$PARSE_DIRS"; echo "AUDIO_MODES=$AUDIO_MODES"
+  echo "## config"; echo "WORK=$WORK"; echo "CHECKPOINTS=$CHECKPOINTS"; echo "CHECKPOINT_DIRS=$CHECKPOINT_DIRS"; echo "PARSE_DIRS=$PARSE_DIRS"; echo "AUDIO_MODES=$AUDIO_MODES"; echo "TRAIN_TASK_CONTEXT=$TRAIN_TASK_CONTEXT"; echo "AMP_SKILL=$AMP_SKILL"; echo "AMP_AUDIO=$AMP_AUDIO"; echo "SKILL_CKPT=$SKILL_CKPT"
   echo
   echo "## summary"; cat "$REPORT_DIR/summary.txt"
   echo

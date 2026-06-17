@@ -481,6 +481,13 @@ def run(args) -> None:
 
     train_ds = MultiTaskAssemblerDataset(args.train_n, args.classes, args.evidence_cells, args.dim, task_families, solution_families, args.seed, args.noise)
     val_ds = MultiTaskAssemblerDataset(args.val_n, args.classes, args.evidence_cells, args.dim, task_families, solution_families, args.seed + 1000, args.noise)
+    # Critical: validation must test new examples/noise, not a different label universe.
+    # Keep the same class/task/head/solution prototypes across train/val so class ids
+    # and task ids mean the same thing. Otherwise validation is effectively impossible.
+    val_ds.class_proto = train_ds.class_proto.clone()
+    val_ds.task_proto = train_ds.task_proto.clone()
+    val_ds.solution_proto = train_ds.solution_proto.clone()
+    val_ds.head_proto = train_ds.head_proto.clone()
     train = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=args.pin_memory)
     val = DataLoader(val_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.workers, pin_memory=args.pin_memory)
     skill_weights = {
