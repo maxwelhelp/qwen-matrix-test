@@ -4,7 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-bash agent_scripts/patch_operatorbank_v2_plus1.sh
+# Main patch is allowed to fail if it was already applied locally; the hotfix
+# below repairs partial/idempotent states and compiles the files.
+bash agent_scripts/patch_operatorbank_v2_plus1.sh || echo "[opv2] main patch already applied or partially applied; running hotfix"
+bash agent_scripts/patch_operatorbank_v2_hotfix.sh
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 REPORT_DIR="agent_reports/operatorbank_v2_plus1_${STAMP}"
