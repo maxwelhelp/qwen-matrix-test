@@ -1,145 +1,137 @@
-# Editor Actor-Critic Policy Plan V2
+# Editor Actor-Critic Policy Plan V3
 
-This plan replaces the idea of a single magic central attention head with a real policy loop around the existing matrix-program editor.
+This is the implementation-safe version of the central-mind plan for the current MatrixProgramAssembler codebase.
 
-The core correction:
+The previous V2 skeleton was directionally correct, but it still had architecture ambiguities. V3 fixes those before coding:
 
-```text
-The editor is the actuator.
-The critic is the first predictive intelligence.
-The memory is tested experience data.
-The probe generates labels by real counterfactual tests.
-The actor is a sparse policy that sends bounded feedback back into the assembly workshops.
-The growth loop promotes repeatedly useful repairs into new reusable macros/operators.
-```
-
-Everything that is applied online remains soft, matrix-based, and differentiable.  
-Everything that is remembered as truth must be tested on heldout/counterfactual probes.
+1. downstream feedback cannot look into the future inside the same forward pass;
+2. feedback_bias and actor_bias must have different safety semantics;
+3. feedback bus must not be implemented before tested memory exists;
+4. Tier-2 rollback must restore full training state, not only weights;
+5. growth/promotion needs local and global tiers;
+6. macro/operator embeddings must be content-based, not integer-id lookup.
 
 ---
 
-## 1. Why this exists
+## 1. Core thesis
 
-The current assembler is already differentiable:
+The central mind is not one magic attention head.
+
+It is a safe actor-critic loop around the existing editor:
 
 ```text
-loss -> gradient -> flow logits / editor / head / adapters change
+Editor = actuator that edits assembly logits.
+Probe = counterfactual tester that creates real labels.
+Memory = tested accepted/rejected/uncertain edit records.
+Critic = model predicting heldout gain + uncertainty + risk.
+Actor = sparse policy that applies bounded edits.
+Feedback bus = lagged/validated experience sent back into assembly workshops.
+Growth loop = promotes repeatedly useful recipes into new macros/operators.
 ```
 
-So a central mind that only reads `grad * weight` and says “increase what gradient already increases” is not intelligence. It is just a logger for SGD.
-
-The central mind must add signals a single backprop step does not have:
-
-1. cross-run and cross-task memory;
-2. heldout/generalization-aware validation;
-3. counterfactual tests for suppressed components;
-4. uncertainty-aware exploration;
-5. safe deployment with LCB and rollback;
-6. open-ended promotion of new macro/operator recipes.
+Everything online remains soft and matrix-based.  
+Everything remembered as truth must be tested on heldout/counterfactual checks.
 
 ---
 
-## 2. Main architecture
+## 2. What is allowed to affect logits
+
+Current assembler logits are conceptually:
 
 ```text
-Assembler components propose a matrix program
-        ↓
-Editor applies soft edits to assembly logits
-        ↓
-Task/head computes train + heldout signals
-        ↓
-Observer records what was assembled and what editor changed
-        ↓
-Probe tests counterfactual candidate edits
-        ↓
-Memory stores only tested accepted/rejected/uncertain edits
-        ↓
-Critic learns (context, edit) -> heldout_gain + uncertainty + risk
-        ↓
-Actor chooses sparse bounded edit bias
-        ↓
-Feedback bus sends results back into primitive/operator/macro/read/write selectors
-        ↓
-Growth loop promotes repeatedly useful patterns into new macros/operators
+flow_logits = base + context + current_editor + macro_bias
 ```
 
-This is not one module. It is a closed loop.
-
----
-
-## 3. Existing parts to reuse
-
-### 3.1 Editor as actuator
-
-Current `FlowEditAttention` already edits:
-
-```text
-read logits
-primitive logits
-slot transition logits
-primitive transition logits
-composition logits
-write logits
-```
-
-It should become the main actuator, not be replaced.
-
-Future actor outputs must enter as extra bounded biases:
+Future version:
 
 ```text
 flow_logits = base + context + current_editor + macro_bias + feedback_bias + actor_bias
 ```
 
-### 3.2 MacroStepBank
+But `feedback_bias` and `actor_bias` are not the same thing.
 
-Macro is a reusable step recipe, not a primitive:
+### 2.1 feedback_bias
+
+`feedback_bias` is a learned conditioning path inside the normal bi-level architecture training.
+
+It receives features from lagged traces / memory summaries / critic summaries, but it is optimized by gradient on the heldout architecture path.
+
+It is not a direct deploy decision.
+
+Therefore:
 
 ```text
-macro = read + primitive mix + transitions + composition + write
+feedback_bias = trainable arch parameter path
+safety = normal heldout bi-level training + regularization
 ```
 
-The actor can:
+### 2.2 actor_bias
 
-- activate macro;
-- suppress background macro;
-- replace macro;
-- add small macro delta;
-- promote tested macro variation later.
+`actor_bias` is a direct decision from the actor/policy based on tested edits and critic scoring.
 
-### 3.3 OperatorBankV2
+It must be controlled by:
 
-The six external primitive families stay compatible, but internally they can contain selectable variants:
+```text
+LCB deploy score
+sparse top-k mask
+trust region
+hard rollback
+cooldown
+```
 
-- low-rank rank/size;
-- butterfly depth;
-- Haar/wavelet-like transform;
-- local smooth/diff;
-- diagonal gate;
-- phase variants;
-- future Fourier/DCT/Toeplitz variants.
+If rollback disables actor intervention, `actor_bias` is disabled. `feedback_bias` stays as part of normal trained architecture, but must not directly copy the rejected actor edit.
 
-The actor/critic must see these internal choices too.
+This separation avoids two channels fighting each other.
 
 ---
 
-## 4. Feedback bus into assembly workshops
+## 3. Causality of feedback
 
-The most important addition: the editor’s result must return to the components that assemble the program.
+A selector at step `L/S` cannot use information from later steps in the same forward pass unless the model uses a two-pass draft/refine scheme.
 
-Assemblers/selectors should not only see raw context. They should also see:
+Fields like:
 
 ```text
-what editor tried here
-whether it helped or hurt
-what critic predicts now
-what memory says for similar contexts
-what downstream slots/classes consumed this component
-whether this component is stale/collapsed/overused
+who reads this slot later
+next-step read/write histograms
+downstream consumer
 ```
 
-### 4.1 Assembly workshops
+are not available causally during the first pass.
 
-Treat each selection site as a workshop:
+### MVP rule: lag-by-one feedback
+
+For MVP, feedback is lagged:
+
+```text
+forward pass t:
+  assemble program
+  record trace, downstream usage, editor actions, head reads
+  evaluate/probe if scheduled
+  update memory/critic
+
+forward pass t+1 or next epoch:
+  use summarized feedback from previous passes as conditioning features
+```
+
+This is cheap and does not create a future-to-past causal loop.
+
+### Later option: draft-refine
+
+Optional expensive mode later:
+
+```text
+pass 1: draft program, collect downstream context
+pass 2: refine same batch using downstream feedback from pass 1
+```
+
+This costs roughly two forwards and should not be the first implementation.
+
+---
+
+## 4. Assembly workshops and feedback bus
+
+The assembly workshops are the places where the program is built:
 
 1. primitive workshop;
 2. operator-size/depth workshop;
@@ -151,147 +143,52 @@ Treat each selection site as a workshop:
 8. step/layer recipe workshop;
 9. global budget/complexity workshop.
 
-Every workshop receives a projected feedback vector:
+Each workshop eventually receives a projected feedback vector:
 
 ```text
-workshop_logits += workshop_feedback_projection(feedback_token)
+primitive_logits += primitive_feedback_bias
+operator_variant_logits += operator_feedback_bias
+primitive_transition_logits += transition_feedback_bias
+read_logits += read_feedback_bias
+write_logits += write_feedback_bias
+macro_selector_logits += macro_feedback_bias
+step_alive_logits += step_feedback_bias
 ```
 
-Examples:
+But this must be implemented only after memory/probe/critic exist.
 
-```text
-primitive_logits[L,S,B,K,P] += feedback_primitive_bias
-operator_variant_logits[L,S,B,K,F,V] += feedback_operator_bias
-primitive_transition_logits[L,S,P,P] += feedback_transition_bias
-read_logits[L,S,B,K,A] += feedback_read_bias
-write_logits[L,S,B,A] += feedback_write_bias
-macro_selector_logits[L,S,B,M] += feedback_macro_bias
-step_alive_logits[L,S] += feedback_step_bias
-```
+### Feedback token content
 
-### 4.2 Feedback token content
-
-For each location/component:
+For a location/component, use lagged features:
 
 ```text
 location: L/S/B/K/A/P/M
 component type
-current soft weight
-entropy of its group
+current/previous soft weight
+entropy of group
 operator-v2 family weights
-macro id / macro weight
-last editor action
-last editor scale
-train gain
-heldout gain
-noise std
-z-score
-accepted/rejected/uncertain/stale
-critic mean gain
-critic uncertainty
-critic risk
+macro id/content embedding
+last editor action at this location
+last actor action at this location
+train gain / heldout gain from tested probes
+noise std / z-score
+accepted/rejected/uncertain/stale flag
+critic mean gain / uncertainty / risk
 retrieved memory accepted/rejected ratio
-who reads this slot later
-class/head pressure
-next-step read/write/primitive histograms
+previous-pass downstream consumer summary
+previous-pass class/head pressure
 training progress / epoch fraction
 ```
 
-This is the real “reverse answer” from editor back to the assembly shops.
+Do not feed same-pass future information into current-step logits.
 
 ---
 
-## 5. Typed object heads, not one magic head
+## 5. Probe policy vs deploy policy
 
-Use small matrix-program object heads, not raw-sequence attention.
+Separate exploration from live deployment.
 
-Suggested heads:
-
-### Location and role
-
-1. phase-role head;
-2. layer-order head;
-3. block-specialization head;
-4. slot-specialization head.
-
-### Component heads
-
-5. primitive-usefulness head;
-6. operator-size/depth head;
-7. transition-chain head;
-8. read-cell head;
-9. write-cell head;
-10. composition head.
-
-### Macro heads
-
-11. macro-selection head;
-12. macro-conflict/collapse head;
-13. macro-variation head;
-14. macro-memory-retrieval head.
-
-### Task/head heads
-
-15. class-slot head;
-16. class-confusion head;
-17. downstream-consumer head;
-18. head-pressure head.
-
-### Stability/safety heads
-
-19. entropy/collapse head;
-20. complexity-budget head;
-21. memory/global-usage head;
-22. soft-vs-discrete-gap head;
-23. heldout-risk head;
-24. non-stationarity/recency head.
-
-MVP: 16-32 micro-heads. Later: 64-128.  
-Do not build a huge LLM-like head over raw audio tokens.
-
----
-
-## 6. Critic
-
-The critic predicts the measured effect of an edit.
-
-```text
-critic(context_embedding, edit_embedding, metrics, recency, complexity)
-    -> mean_heldout_gain
-    -> uncertainty
-    -> risk_score
-```
-
-### 6.1 Cold-start critic
-
-Do not start with a large MLP ensemble when memory has only hundreds of records.
-
-Cold-start options:
-
-1. ridge / Bayesian linear regression on fixed embeddings;
-2. small calibrated linear model with posterior variance;
-3. only later: MLP ensemble when records > 3k-5k.
-
-Reason: early high-dimensional MLP critic can memorize noise and be badly calibrated out of distribution.
-
-### 6.2 Later critic
-
-When enough records exist:
-
-```text
-critic_ensemble = 3-5 small MLPs
-uncertainty = variance across ensemble
-```
-
-The critic must be trained on tested edits only.
-
----
-
-## 7. Probe policy vs deploy policy
-
-This must be explicit.
-
-### 7.1 Probe / exploration uses UCB
+### 5.1 Probe uses UCB
 
 For deciding what to test:
 
@@ -299,203 +196,174 @@ For deciding what to test:
 score_probe(edit) = mean_gain + beta * uncertainty - risk_penalty - complexity_penalty
 ```
 
-Uncertainty is good here because it means “worth exploring”.
+Uncertainty is a reason to explore.
 
-### 7.2 Live deployment uses LCB
+### 5.2 Deploy uses LCB
 
-For deciding what to actually apply during the real run:
+For deciding what to apply to the live training run:
 
 ```text
 score_deploy(edit) = mean_gain - beta * uncertainty - risk_penalty - complexity_penalty
 ```
 
-Uncertainty is bad here because live deployment must be conservative.
+Uncertainty is a reason to be conservative.
 
-Never use UCB directly for online actor bias.
-
----
-
-## 8. Candidate generation
-
-Candidate sources:
-
-1. gradient pressure candidates;
-2. suppressed revival candidates;
-3. macro alternatives;
-4. memory-retrieved edits;
-5. anti-collapse edits;
-6. soft/discrete-gap edits;
-7. operator-size/depth edits;
-8. step/layer alive edits;
-9. growth/promotion candidates.
-
-Candidate format:
-
-```json
-{
-  "edit_type": "increase_primitive | shift_read | replace_macro | increase_transition | suppress_component | activate_step | change_operator_size | promote_macro",
-  "where": "L1.S1.B2.K0",
-  "target": "product_gate / memory.M2 / macro_7 / low_rank_r16",
-  "delta_logit": 0.25,
-  "scope": "component | step | layer | global",
-  "complexity_delta": 0.01
-}
-```
-
-Before critic exists, bootstrap candidate score:
-
-```text
-score_bootstrap =
-  0.30 * gradient_score
-+ 0.25 * suppressed_revival_score
-+ 0.25 * memory_similarity_score
-+ 0.15 * anti_collapse_score
-+ 0.05 * random_exploration
-```
-
-Switch to critic gradually:
-
-```text
-critic_weight = min(n_tested_records / N0, 1.0)
-score = (1 - critic_weight) * score_bootstrap + critic_weight * score_probe
-```
-
-No hard cutover.
+Never deploy UCB-selected edits directly.
 
 ---
 
-## 9. Two-tier testing
+## 6. Sparse actor, not dense second optimizer
+
+The actor must not output dense tiny biases across the entire program.
+
+Memory/probe labels are sparse, mostly one-factor or two-factor edits. Actor output should match that structure.
+
+Required controls:
+
+```text
+L1 penalty on actor bias
+top-k mask per action family
+max edits per window
+max total bias norm
+sparse accepted-edit distillation
+penalty for many tiny nonzero changes
+```
+
+Actor output should look like:
+
+```text
+few strong tested edits
+not dense noise everywhere
+```
+
+---
+
+## 7. Two-tier testing and rollback
 
 ### Tier 1: cheap screen
 
-Forward-only heldout micro-batch:
-
 ```text
-apply edit bias temporarily
-forward only
-measure val loss delta
-revert
+save no state
+apply temporary edit bias
+forward-only on heldout micro-batches
+measure loss delta
+revert bias
 ```
 
 ### Tier 2: expensive verify
 
-For candidates that pass screen:
-
 ```text
+save full training state
 apply edit
-train/adapt N small steps or run short heldout window
-measure heldout gain
-revert or keep
+run N small train/adapt steps or a short heldout window
+measure train + heldout
+restore or keep
 ```
 
-Memory `accepted=true` requires Tier 2 or repeated Tier 1 with strong significance.
+Tier-2 must snapshot and restore:
+
+```text
+model.state_dict()
+optimizer state
+scaler state if AMP is used
+scheduler state if used
+random seeds / RNG state if needed
+BatchNorm/running stats if any exist
+```
+
+Restoring only model weights is not enough because Adam momentum/variance buffers would be polluted by test steps.
 
 ---
 
-## 10. Noise floor and significance
+## 8. Noise floor and significance
 
-Estimate baseline noise:
+Noise is not constant across training.
+
+Recompute noise periodically:
 
 ```text
-baseline_losses = unchanged model on several heldout micro-batches
-noise_std = std(baseline_losses)
+every N windows:
+  evaluate unchanged model on fresh heldout micro-batches
+  noise_std = std(losses)
+  loss_scale = mean(losses)
 ```
 
-Acceptance:
+Acceptance rule:
 
 ```text
-accepted if gain > max(min_gain, k * noise_std)
-rejected if gain < -max(min_gain, k * noise_std)
+threshold = max(k * noise_std, relative_min_gain * loss_scale)
+accepted if gain > threshold
+rejected if gain < -threshold
 otherwise uncertain
 ```
 
-Recommended:
+Recommended start:
 
 ```text
 k = 2.0
-min_gain = small nonzero threshold
+relative_min_gain = 0.002 to 0.005
 ```
 
 Store:
 
 ```text
 noise_std
-z_score
+loss_scale
+z_score = gain / noise_std
 num_batches
-gain_metric
 ```
 
 ---
 
-## 11. Sparse actor, not dense second optimizer
+## 9. Critic cold start
 
-Memory validates mostly sparse one-factor or two-factor edits.  
-Therefore the actor must not output unrestricted dense tensors everywhere.
+Do not start with a high-capacity MLP ensemble when there are only hundreds of records.
 
-Required constraints:
-
-1. L1 sparsity on actor bias;
-2. top-k mask per action family;
-3. max edit count per epoch/window;
-4. distillation to sparse accepted edits;
-5. penalty for many small nonzero changes.
-
-Online actor bias should look like:
+Start with:
 
 ```text
-few strong tested edits
-not tiny noise everywhere
+ridge / Bayesian linear regression over fixed embeddings
 ```
 
-Otherwise it becomes another dense optimizer and repeats the mirror-SGD problem.
+Then switch gradually:
+
+```text
+if n_records < 3000:
+  use ridge/Bayesian linear critic
+else:
+  blend into small MLP ensemble
+```
+
+Use smooth blending:
+
+```text
+critic_weight = min(n_records / N0, 1)
+score = (1 - critic_weight) * bootstrap_score + critic_weight * critic_score
+```
+
+No hard cutover.
 
 ---
 
-## 12. Hard rollback + soft trust region
+## 10. Closed-loop critic re-verify
 
-Soft trust region:
+Actor can exploit critic errors.
 
-```text
-scale starts at 0.03
-if heldout improves: scale *= 1.05
-if heldout worsens: scale *= 0.5
-max scale: 0.20
-```
-
-Hard rollback is also required:
+Every scheduled window:
 
 ```text
-save checkpoint before actor intervention
-if heldout window worsens by > k * noise_std:
-    restore checkpoint
-    disable actor bias for cooldown window
-    store edit as rejected/harmful
+take top edits actually deployed by actor
+run Tier-2 verify
+compare critic predicted_gain vs real_gain
+store prediction error
+retrain critic with priority on actor-visited regions
 ```
 
-Trust-region scale only protects future steps. Rollback repairs damage already done.
+The critic must be accurate where the actor wants to act, not only on random old memory.
 
 ---
 
-## 13. Closed-loop critic re-verify
-
-Actor can exploit critic errors. This is standard model-based RL failure.
-
-Protection:
-
-```text
-every N steps/epochs:
-    take top edits actor actually deployed
-    run Tier-2 verify
-    compare critic predicted_gain vs real_gain
-    store prediction error
-    retrain critic with priority on actor-visited regions
-```
-
-The critic must be most accurate where the actor wants to act.
-
----
-
-## 14. Memory bank
+## 11. Memory bank
 
 Memory stores only tested records.
 
@@ -504,12 +372,13 @@ Record fields:
 ```text
 context_embedding
 edit_embedding
-edit type / location / target
+edit type / location / target / scope
 train_gain
 heldout_gain
 noise_std
+loss_scale
 z_score
-accepted/rejected/uncertain
+accepted/rejected/uncertain/stale
 critic_prediction_at_time
 prediction_error_after_reverify
 complexity_delta
@@ -519,10 +388,12 @@ run_id
 model_version
 program_version
 source_task
-staleness / recency weight
+recency_weight
+reproducibility_weight
+full_test_state_hash optional
 ```
 
-### 14.1 Non-stationarity
+### 11.1 Non-stationarity
 
 Old records can become stale.
 
@@ -532,28 +403,47 @@ Retrieval weight:
 memory_weight = similarity * recency_weight * reproducibility_weight
 ```
 
-Retest old accepted edits periodically. If they stop working, decay confidence or mark stale.
+Retest old accepted edits periodically.
 
-### 14.2 Compound edits
+### 11.2 Compound edits
 
-Early memory should use one-factor edits whenever possible.
+Early memory should prefer one-factor edits.
 
 For compound edits:
 
 ```text
 store sub-edits
-run A only / B only / A+B factorial tests when possible
+run A only / B only / A+B when possible
 ```
-
-This prevents false credit assignment.
 
 ---
 
-## 15. Cross-task fixed-size embeddings
+## 12. Content-based macro/operator embeddings
 
-For transfer across SMC, matrix-water-blockless, TTS/vocoder, etc., use fixed-size typed-token encoders.
+Growth adds new macros and operators. Integer lookup embeddings are fragile.
 
-Do not rely on raw shape-specific histograms only.
+Do not encode macro identity only as `macro_id` table lookup.
+
+Instead encode macro/operator content:
+
+```text
+macro_content = read prototype + primitive prototype + transition prototype + composition prototype + write prototype
+macro_embedding = MacroContentEncoder(macro_content)
+```
+
+For operator variants:
+
+```text
+operator_embedding = OperatorContentEncoder(type, rank/depth/radius/cost, matrix-operator family stats)
+```
+
+This lets newly promoted macros/operators get embeddings immediately without expanding learned ID tables.
+
+---
+
+## 13. Cross-task fixed-size embeddings
+
+For transfer across SMC, matrix-water-blockless, TTS/vocoder, etc., use typed-token pooling:
 
 ```text
 ProgramContextEncoder:
@@ -586,47 +476,41 @@ edit_embedding: 64 or 128
 
 ---
 
-## 16. Open-ended growth / promotion loop
+## 14. Growth / promotion loop
 
-Without growth, actor only tunes a fixed search space. That is useful, but not open-ended architecture synthesis.
+Without growth, actor only tunes a fixed search space.
 
-Add Stage 8: tested-and-promoted macro/operator growth.
+Add two promotion tiers.
 
-### 16.1 Macro promotion criteria
+### 14.1 Local promotion
 
-Promote a tested pattern into `MacroStepBank` if:
+For one run/task:
+
+Promote a pattern to local macro/operator if:
 
 ```text
 heldout gain passes noise gate
-reused across >= N examples/runs/tasks
-embedding distance from existing macros > duplicate threshold
+reused across multiple L/S/B/K locations in the same run
+not duplicate of existing local macro
 complexity budget acceptable
-not stale after retest
+retest remains positive
 ```
 
-Promoted macro becomes first-class:
+This is realistic on one P40.
+
+### 14.2 Global promotion
+
+Promote to global bank if:
 
 ```text
-new macro id
-new macro read/primitive/transition/composition/write prototype
-available to actor like any other macro
+useful across multiple runs/tasks
+embedding distance from existing global macros > duplicate threshold
+mean heldout gain positive
+risk/variance acceptable
+not stale after retests
 ```
 
-### 16.2 Operator variant promotion
-
-If repeated edits discover a useful operator variant:
-
-```text
-low_rank_r16 + product_gate + phase path
-specific wavelet/diff/smooth mix
-block_butterfly depth2 pattern
-```
-
-then promote it as a named operator variant inside OperatorBankV2.
-
-Do not allow arbitrary Python generation first. Promote only combinations of existing safe matrix operators.
-
-### 16.3 Growth memory
+### 14.3 Promotion record
 
 Every promoted element stores:
 
@@ -636,13 +520,17 @@ support count
 mean heldout gain
 variance/risk
 complexity cost
-examples where useful
-examples where harmful
+contexts where useful
+contexts where harmful
+local/global status
+content embedding
 ```
+
+Promoted macros become first-class MacroStepBank entries. Promoted operator variants become selectable OperatorBankV2 entries.
 
 ---
 
-## 17. Soft-vs-discrete diagnostics
+## 15. Soft-vs-discrete diagnostics
 
 Periodically evaluate:
 
@@ -655,134 +543,152 @@ discretization_gap = discrete_val_loss - soft_val_loss
 
 If gap is large:
 
-- anneal temperature;
-- add path dropout;
-- strengthen entropy band;
-- prefer tested sparse edits;
-- do not trust dense soft actor too much.
+```text
+anneal temperature
+add path dropout
+strengthen entropy band
+prefer tested sparse edits
+reduce trust in dense actor output
+```
 
 ---
 
-## 18. Compute budget
+## 16. Compute budget
 
-The central mind has a cost. Track it.
+The central mind must not dominate training cost.
 
-Suggested limits:
+Start limits:
 
 ```text
 screen/probe budget <= 10-20% of training time
-critic training budget <= small scheduled window
-Tier-2 verify only for top candidates
+critic training <= small scheduled window
+Tier-2 verify only top candidates
 ```
 
-Measure net benefit:
+Always report:
 
 ```text
 accuracy gain / extra wall-clock cost
 heldout gain / probe budget
 ```
 
-A smarter controller that doubles runtime for +0.2% is not useful on one P40.
-
 ---
 
-## 19. Implementation order
+## 17. Correct implementation order for this repo
 
 ### Stage 1: reliable observation
 
 - fix macro logging;
-- log operator-v2 family choices;
-- log step alive;
+- log OperatorBankV2 family choices;
+- log step_alive;
 - log class-slot reads;
 - log memory/global usage;
-- log editor actions/results.
+- log editor actions/results;
+- no feedback injection yet.
 
 ### Stage 2: anti-collapse + bi-level
 
 - primitive/macro load balance;
 - entropy band;
 - step/memory budget;
-- architecture parameters trained on heldout path.
+- architecture/program parameters trained on heldout path.
 
-### Stage 3: feedback bus MVP
+### Stage 3: counterfactual screen + memory + cold-start critic MVP
 
-- create `ProgramFeedbackEncoder`;
-- project feedback into primitive/read/write/transition/macro/step logits;
-- initially feed only tested editor results and simple memory summaries.
+This is the first real active-mind target.
 
-### Stage 4: counterfactual screen
+- generate sparse candidate edits;
+- Tier-1 forward-only heldout screen;
+- dynamic noise floor;
+- JSONL memory bank;
+- ridge/Bayesian linear critic;
+- choose one sparse LCB-safe edit per window;
+- apply with scale 0.03;
+- Tier-2 verify if needed;
+- hard rollback if harmful;
+- store accepted/rejected/uncertain.
 
-- generate sparse candidates;
-- forward-only heldout screen;
-- noise floor;
-- store tested records.
+No neural feedback bus yet.
 
-### Stage 5: memory bank
+### Stage 4: feedback bus MVP
 
-- JSONL memory;
-- fixed-size embeddings;
-- accepted/rejected/uncertain/stale.
+Only after Stage 3 produces tested memory.
 
-### Stage 6: cold-start critic
+- build lag-by-one feedback features;
+- feed memory/critic summaries as conditioning into workshops;
+- optimize feedback_bias through bi-level heldout path;
+- keep actor_bias separate and safety-controlled.
 
-- Bayesian/ridge linear critic first;
-- upgrade to MLP ensemble after enough tested records.
+### Stage 5: local growth/promotion
 
-### Stage 7: rule/critic sparse actor
+- promote repeated local macros/operators inside one run;
+- content-based embeddings;
+- local bank only.
 
-- choose edit by LCB for deploy;
-- UCB only for probe;
-- apply sparse bounded bias;
-- hard rollback + cooldown.
+### Stage 6: critic actor refinement
 
-### Stage 8: growth/promotion
+- UCB for probe;
+- LCB for deploy;
+- closed-loop re-verify;
+- sparse actor rules.
 
-- promote repeated useful macro variations;
-- promote safe operator variants;
-- update MacroStepBank / OperatorBankV2.
+### Stage 7: neural typed-token actor
 
-### Stage 9: neural typed-token actor
+Only after enough tested records.
 
 - typed object heads;
-- critic distillation;
+- sparse top-k output;
 - accepted/rejected imitation;
+- critic distillation;
 - heldout path training;
-- sparse top-k output and trust-region deployment.
+- trust-region + rollback.
+
+### Stage 8: global growth/promotion
+
+- promote patterns useful across runs/tasks;
+- update global MacroStepBank / OperatorBankV2.
 
 ---
 
-## 20. Minimal first code target
+## 18. Minimal first code target
 
-Do not build the neural actor first.
+Do not implement `ProgramFeedbackEncoder` first.
 
-First useful MVP:
-
-```text
-ProgramFeedbackEncoder + CounterfactualScreen + MemoryBank + cold-start Critic
-```
-
-Then:
+First implement:
 
 ```text
-one sparse LCB-selected edit per epoch/window
-apply with scale 0.03
-verify heldout
-rollback if harmful
-store record
+CounterfactualScreen
+ProgramMemoryBank
+ColdStartCritic
+SparseLCBEditApplier
+FullTrainingStateRollback
 ```
 
-This is the smallest real active mind.
+Then one safe loop:
+
+```text
+once per epoch/window:
+  observe current program summaries
+  generate sparse candidate edits
+  screen on heldout micro-batches
+  update memory
+  train/update ridge critic
+  pick deploy edit by LCB
+  apply one sparse bias with scale 0.03
+  verify / rollback / store result
+```
+
+This is the smallest real active mind in the current codebase.
 
 ---
 
-## 21. Short summary
+## 19. Short summary
 
-The editor changes the program.  
-The feedback bus teaches the assembly workshops what editor actions worked.  
-The critic predicts which future edits will help.  
-UCB explores; LCB deploys safely.  
-The actor must be sparse.  
-Hard rollback is mandatory.  
-Memory must store only tested edits.  
-Growth/promotion turns repeated useful repairs into new first-class macros/operators.  
-That is the path from differentiable tuning to real matrix-program architecture synthesis.
+Do not build the feedback bus before memory exists.  
+Do not let same-pass downstream information flow backward in the forward pass.  
+Do not mix feedback_bias and actor_bias safety semantics.  
+Do not deploy UCB edits; deploy LCB edits only.  
+Do not rollback only weights; rollback full training state.  
+Do not use ID-only macro embeddings; use content embeddings.  
+Do not wait for cross-task support before local promotion.  
+Start with counterfactual screen + memory + cold-start critic + one sparse safe edit per window.
