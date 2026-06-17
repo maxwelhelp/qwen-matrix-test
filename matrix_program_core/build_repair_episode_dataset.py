@@ -46,6 +46,19 @@ def _summary_one(pack: Dict[str, torch.Tensor], i: int) -> Dict[str, torch.Tenso
     }
 
 
+def _sketch_one(pack: Dict[str, torch.Tensor], i: int) -> Dict[str, torch.Tensor]:
+    if all(key in pack for key in ms.SKETCH_KEYS):
+        return {key: pack[key][i].float() for key in ms.SKETCH_KEYS}
+    return {
+        "primitive_hist": pack["primitive_slot_flow"][i].float().mean(dim=(0, 1, 2)),
+        "primitive_transition_hist": pack["primitive_transition_flow"][i].float().mean(dim=0).flatten(),
+        "read_hist": pack["read_flow"][i].float().mean(dim=(0, 1, 2)),
+        "write_hist": pack["write_flow"][i].float().mean(dim=(0, 1)),
+        "slot_transition_hist": pack["slot_transition_flow"][i].float().mean(dim=(0, 1)).flatten(),
+        "composition_hist": pack["slot_composition_flow"][i].float().mean(dim=(0, 1)),
+    }
+
+
 def _target_mask_for_visible(visible: torch.Tensor) -> torch.Tensor:
     # Even visible mechanisms get a weak consistency loss in the trainer, but
     # missing parts are the primary target.
@@ -196,8 +209,7 @@ def build(args) -> Dict[str, torch.Tensor]:
     for key in ("role_id", "input_kind_id", "output_kind_id", "loss_kind_id", "readout_kind_id", "num_outputs", "sequence_length", "hidden_dim", "extra_scalar"):
         out[key] = []
     for key in ms.SKETCH_KEYS:
-        if key in pack:
-            out[key] = []
+        out[key] = []
     out.update({
         "episode_task_id": [],
         "episode_visible": [],
@@ -211,6 +223,7 @@ def build(args) -> Dict[str, torch.Tensor]:
 
     for i in range(limit):
         episodes = _make_episodes_for_one(pack, i, int(args.steps_core), generator, args.episode_mode)
+        sketch = _sketch_one(pack, i)
         for stage_idx, (inp, visible, target, feedback, task_id) in enumerate(episodes):
             for key in ms.FLOW_KEYS:
                 out[key].append(pack[key][i].float())
@@ -218,8 +231,7 @@ def build(args) -> Dict[str, torch.Tensor]:
             for key in ("role_id", "input_kind_id", "output_kind_id", "loss_kind_id", "readout_kind_id", "num_outputs", "sequence_length", "hidden_dim", "extra_scalar"):
                 out[key].append(pack[key][i])
             for key in ms.SKETCH_KEYS:
-                if key in pack:
-                    out[key].append(pack[key][i].float())
+                out[key].append(sketch[key].float())
             out["episode_task_id"].append(torch.tensor(task_id, dtype=torch.long))
             out["episode_visible"].append(visible.float())
             out["episode_target_mask"].append(target.float())

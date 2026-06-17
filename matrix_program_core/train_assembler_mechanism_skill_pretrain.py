@@ -151,7 +151,13 @@ def infer_cfg_from_pack(pack: Dict[str, torch.Tensor], args) -> AssemblerConfig:
     )
 
 
-def make_context_tokens(task_context: TaskIOContextEncoder, batch: Dict[str, torch.Tensor], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def make_context_tokens(
+    task_context: TaskIOContextEncoder,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+    head_query: torch.Tensor | None = None,
+) -> torch.Tensor:
     B = int(batch["role_id"].shape[0])
     return task_context(
         B,
@@ -166,7 +172,7 @@ def make_context_tokens(task_context: TaskIOContextEncoder, batch: Dict[str, tor
         sequence_length=batch["sequence_length"].to(device),
         hidden_dim=batch["hidden_dim"].to(device),
         extra_scalar=batch["extra_scalar"].to(device),
-        head_query=None,
+        head_query=head_query,
     )
 
 
@@ -385,13 +391,15 @@ def _batch_sketch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[
 
 def synthetic_live_targets(batch: Dict[str, torch.Tensor], task_ids: torch.Tensor, classes: int, device: torch.device) -> torch.Tensor:
     sketch = _batch_sketch(batch, device)
-    score = torch.zeros(task_ids.shape[0], device=device)
-    for i, key in enumerate(SKETCH_KEYS, 1):
-        x = sketch[key].float()
-        w = torch.linspace(0.31 + 0.07 * i, 1.37 + 0.11 * i, x.shape[-1], device=device)
-        score = score + (x * w.view(1, -1)).sum(dim=-1) * float(i)
-    score = score + task_ids.to(device=device, dtype=torch.float32) * 0.73
-    return torch.remainder((score * 997.0).abs().long(), int(classes))
+    primitive_id = sketch["primitive_hist"].float().argmax(dim=-1)
+    read_id = sketch["read_hist"].float().argmax(dim=-1)
+    write_id = sketch["write_hist"].float().argmax(dim=-1)
+    comp_id = sketch["composition_hist"].float().argmax(dim=-1)
+    task = task_ids.to(device=device, dtype=torch.long)
+    # Structured, learnable synthetic class. It still depends on the matrix
+    # recipe, but avoids hash-like labels that only add noise to the live head.
+    y = primitive_id + 2 * read_id + 3 * write_id + 5 * comp_id + task
+    return torch.remainder(y.long(), int(classes))
 
 
 def targets_from_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -655,7 +663,8 @@ def run_epoch(core, task_context, evidence_builder, live_head, loader, device, d
             opt.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(train):
             with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=use_amp):
-                ctx = make_context_tokens(task_context, batch, device, dtype)
+                head_query = live_head.query if live_head is not None else None
+                ctx = make_context_tokens(task_context, batch, device, dtype, head_query=head_query)
                 mech = evidence_builder(summaries, visible, task_ids.to(device), feedback=feedback, sketch=sketch).to(dtype=dtype)
                 evidence = torch.cat([ctx, mech], dim=1)
                 _cells, aux = core(evidence)
@@ -823,7 +832,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--repair-curriculum", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--repair-cycle-steps", type=int, default=6)
     p.add_argument("--repair-strength", type=float, default=1.0)
-    p.add_argument("--lambda-live-synth", type=float, default=0.0)
+    p.add_argument("--lambda-live-synth", type=float, default=0.08)
     p.add_argument("--live-classes", type=int, default=8)
     p.add_argument("--lambda-entropy-keep", type=float, default=0.01)
     p.add_argument("--min-entropy", type=float, default=0.55)

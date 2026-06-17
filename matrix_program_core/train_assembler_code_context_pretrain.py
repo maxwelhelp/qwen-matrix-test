@@ -89,6 +89,22 @@ READOUT_KIND_IDS = {
 
 CORE_PRIM = list(PRIMITIVES)
 P_IDX = {n: i for i, n in enumerate(CORE_PRIM)}
+FLOW_KEYS = (
+    "read_flow",
+    "primitive_slot_flow",
+    "slot_transition_flow",
+    "primitive_transition_flow",
+    "slot_composition_flow",
+    "write_flow",
+)
+SKETCH_KEYS = (
+    "primitive_hist",
+    "primitive_transition_hist",
+    "read_hist",
+    "write_hist",
+    "slot_transition_hist",
+    "composition_hist",
+)
 
 OLD_TO_CORE_PRIMS = {
     "noop": ["phase_matrix"],
@@ -397,26 +413,67 @@ class CodeContextDataset(Dataset):
             out[k] = self.pack[k][j].long()
         for k in ("num_outputs", "sequence_length", "hidden_dim", "extra_scalar"):
             out[k] = self.pack[k][j].float()
-        for k in ("read_flow", "primitive_slot_flow", "slot_transition_flow", "primitive_transition_flow", "slot_composition_flow", "write_flow"):
+        for k in FLOW_KEYS:
             out[k] = self.pack[k][j].float()
+        for k in SKETCH_KEYS:
+            if k in self.pack:
+                out[k] = self.pack[k][j].float()
         return out
 
 
 class CodeContextEvidenceBuilder(nn.Module):
-    def __init__(self, dim: int, skeleton_kinds: int = 8, extra_tokens: int = 8, dropout: float = 0.02):
+    def __init__(
+        self,
+        dim: int,
+        cfg: AssemblerConfig | None = None,
+        skeleton_kinds: int = 8,
+        extra_tokens: int = 8,
+        dropout: float = 0.02,
+    ):
         super().__init__()
+        P = len(CORE_PRIM)
+        A = int(cfg.address_cells) if cfg is not None else 0
+        K = int(cfg.primitive_slots) if cfg is not None else 0
         self.skeleton_kind = nn.Embedding(skeleton_kinds, dim)
+        self.sketch_proj = nn.ModuleDict()
+        if cfg is not None:
+            self.sketch_proj = nn.ModuleDict({
+                "primitive_hist": nn.Linear(P, dim),
+                "primitive_transition_hist": nn.Linear(P * P, dim),
+                "read_hist": nn.Linear(A, dim),
+                "write_hist": nn.Linear(A, dim),
+                "slot_transition_hist": nn.Linear(K * K, dim),
+                "composition_hist": nn.Linear(K, dim),
+            })
+        self.sketch_type_embed = nn.Parameter(torch.randn(len(SKETCH_KEYS), dim) * 0.02)
         self.extra = nn.Parameter(torch.randn(max(1, extra_tokens), dim) * 0.02)
         self.norm = nn.LayerNorm(dim)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, context: torch.Tensor, skeleton_kind_id: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        context: torch.Tensor,
+        skeleton_kind_id: torch.Tensor | None = None,
+        sketch: Dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         B, _, D = context.shape
         extra = self.extra.to(context.device, context.dtype).view(1, -1, D).expand(B, -1, -1)
+        sketch_tokens: List[torch.Tensor] = []
+        if sketch and self.sketch_proj:
+            for i, key in enumerate(SKETCH_KEYS):
+                value = sketch.get(key)
+                proj = self.sketch_proj[key] if key in self.sketch_proj else None
+                if value is None or proj is None:
+                    continue
+                token = proj(value.to(device=context.device, dtype=torch.float32).view(B, -1)).to(context.dtype)
+                token = token + self.sketch_type_embed[i].to(device=context.device, dtype=context.dtype).view(1, -1)
+                sketch_tokens.append(token.view(B, 1, D))
         if skeleton_kind_id is not None:
             sk = self.skeleton_kind(skeleton_kind_id.to(context.device).long()).view(B, 1, D).to(context.dtype)
             extra = extra + 0.25 * sk
             context = torch.cat([context, sk], dim=1)
+        if sketch_tokens:
+            context = torch.cat([context] + sketch_tokens, dim=1)
         return self.drop(self.norm(torch.cat([context, extra], dim=1)))
 
 
@@ -492,7 +549,7 @@ def make_context_tokens(task_context: TaskIOContextEncoder, batch: Dict[str, tor
 def targets_from_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     # Dataset gives [N,T,...]; assembler_skill_loss expects [T,N,...].
     out = {}
-    for k in ("read_flow", "primitive_slot_flow", "slot_transition_flow", "primitive_transition_flow", "slot_composition_flow", "write_flow"):
+    for k in FLOW_KEYS:
         out[k] = batch[k].to(device, non_blocking=True).transpose(0, 1).contiguous()
     return out
 
@@ -517,7 +574,8 @@ def run_epoch(core, task_context, evidence_builder, loader, device, dtype, args,
         with torch.set_grad_enabled(train):
             with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=use_amp):
                 ctx = make_context_tokens(task_context, batch, device, dtype)
-                evidence = evidence_builder(ctx)
+                sketch = {k: batch[k].to(device, non_blocking=True) for k in SKETCH_KEYS if k in batch}
+                evidence = evidence_builder(ctx, sketch=sketch)
                 _cells, aux = core(evidence)
                 skill, flow_losses = assembler_skill_loss(aux, targets_from_batch(batch, device), skill_weights)
                 entropy_keep = torch.zeros((), device=device)
@@ -587,7 +645,7 @@ def run(args) -> None:
 
     core = MatrixProgramAssemblerCore(cfg).to(device)
     task_context = TaskIOContextEncoder(TaskContextV2Config(dim=args.dim, free_tokens=args.task_context_tokens, max_head_tokens=args.head_context_tokens, dropout=args.dropout)).to(device)
-    evidence_builder = CodeContextEvidenceBuilder(args.dim, extra_tokens=args.extra_context_tokens, dropout=args.dropout).to(device)
+    evidence_builder = CodeContextEvidenceBuilder(args.dim, cfg=cfg, extra_tokens=args.extra_context_tokens, dropout=args.dropout).to(device)
     if args.init_assembler:
         ckpt = torch.load(args.init_assembler, map_location=device)
         state = ckpt.get("assembler_core", ckpt.get("assembler_skill_base", ckpt.get("core", ckpt)))

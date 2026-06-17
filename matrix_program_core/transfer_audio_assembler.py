@@ -501,10 +501,11 @@ def make_runtime_flow_targets(args, cfg: AssemblerConfig, device: torch.device) 
 
 def class_read_diversity_loss(attn: torch.Tensor) -> torch.Tensor:
     # attn [N,C,S]. Penalize classes that read the same slot distribution.
-    a = attn.float().mean(dim=0)
+    a = attn.float()
     a = F.normalize(a, dim=-1)
-    sim = a @ a.t()
-    offdiag = sim - torch.eye(sim.shape[0], device=sim.device)
+    sim = torch.einsum("ncs,nds->ncd", a, a)
+    eye = torch.eye(sim.shape[-1], device=sim.device, dtype=sim.dtype).view(1, sim.shape[-1], sim.shape[-1])
+    offdiag = sim - eye
     return F.relu(offdiag - 0.25).mean()
 
 
@@ -523,13 +524,13 @@ def class_slot_prior(attn: torch.Tensor, sigma: float) -> torch.Tensor:
 
 
 def class_slot_prior_loss(attn: torch.Tensor, sigma: float) -> torch.Tensor:
-    a = attn.float().mean(dim=0).clamp_min(1e-8)
+    a = attn.float().clamp_min(1e-8)
     prior = class_slot_prior(attn, sigma)
-    return -(prior * a.log()).sum(dim=-1).mean()
+    return -(prior.view(1, *prior.shape) * a.log()).sum(dim=-1).mean()
 
 
 def class_attention_entropy(attn: torch.Tensor) -> torch.Tensor:
-    a = attn.float().mean(dim=0).clamp_min(1e-8)
+    a = attn.float().clamp_min(1e-8)
     a = a / a.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     return -(a * a.log()).sum(dim=-1).mean()
 
@@ -547,10 +548,11 @@ def phase_balance_loss(phase_mass: torch.Tensor, min_early: float, max_aggregate
 
 
 def slot_diversity_loss(slots: torch.Tensor) -> torch.Tensor:
-    s = slots.float().mean(dim=0)
+    s = slots.float()
     s = F.normalize(s, dim=-1)
-    sim = s @ s.t()
-    offdiag = sim - torch.eye(sim.shape[0], device=sim.device)
+    sim = torch.einsum("nsd,ntd->nst", s, s)
+    eye = torch.eye(sim.shape[-1], device=sim.device, dtype=sim.dtype).view(1, sim.shape[-1], sim.shape[-1])
+    offdiag = sim - eye
     return F.relu(offdiag - 0.55).mean()
 
 
