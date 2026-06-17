@@ -323,6 +323,23 @@ def record_to_flow_targets(rec: Dict[str, Any], cfg: AssemblerConfig) -> Dict[st
     }
 
 
+def flow_sketch(ft: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Coarse program sketch tokens.
+
+    These are not per-step labels. They are low-bandwidth histograms that tell
+    the assembler what kind of program family the decoded matrix resembles.
+    """
+
+    return {
+        "primitive_hist": ft["primitive_slot_flow"].float().mean(dim=(0, 1, 2)),
+        "primitive_transition_hist": ft["primitive_transition_flow"].float().mean(dim=0).flatten(),
+        "read_hist": ft["read_flow"].float().mean(dim=(0, 1, 2)),
+        "write_hist": ft["write_flow"].float().mean(dim=(0, 1)),
+        "slot_transition_hist": ft["slot_transition_flow"].float().mean(dim=(0, 1)).flatten(),
+        "composition_hist": ft["slot_composition_flow"].float().mean(dim=(0, 1)),
+    }
+
+
 def infer_contract(sk: Any, records: Sequence[Dict[str, Any]], sample_record: Dict[str, Any] | None = None) -> Dict[str, int | float]:
     calls = getattr(sk, "call_counts", {}) or {}
     classes = " ".join(getattr(sk, "detected_classes", []) or []).lower()
@@ -418,6 +435,7 @@ def build_code_context_pack(args, cfg: AssemblerConfig) -> Dict[str, Any]:
     synth = old.StructuredSynthesizer(sk, lib, seed=args.seed, step_scale=args.step_scale, route_scale=args.route_scale, max_program_steps=args.max_program_steps)
     records: List[Dict[str, Any]] = []
     flows: Dict[str, List[torch.Tensor]] = {k: [] for k in ("read_flow", "primitive_slot_flow", "slot_transition_flow", "primitive_transition_flow", "slot_composition_flow", "write_flow")}
+    sketches: Dict[str, List[torch.Tensor]] = {k: [] for k in ("primitive_hist", "primitive_transition_hist", "read_hist", "write_hist", "slot_transition_hist", "composition_hist")}
     contracts: Dict[str, List[torch.Tensor]] = {k: [] for k in ("role_id", "input_kind_id", "output_kind_id", "loss_kind_id", "readout_kind_id", "num_outputs", "sequence_length", "hidden_dim", "extra_scalar")}
     t0 = time.time()
     for i in range(args.n):
@@ -426,6 +444,8 @@ def build_code_context_pack(args, cfg: AssemblerConfig) -> Dict[str, Any]:
         ft = record_to_flow_targets(rec, cfg)
         for k, v in ft.items():
             flows[k].append(v.cpu())
+        for k, v in flow_sketch(ft).items():
+            sketches[k].append(v.cpu())
         for k, v in contract.items():
             dtype = torch.long if k.endswith("_id") else torch.float32
             contracts[k].append(torch.tensor(v, dtype=dtype))
@@ -437,6 +457,8 @@ def build_code_context_pack(args, cfg: AssemblerConfig) -> Dict[str, Any]:
         pack[k] = torch.stack(lst, dim=0)
     for k, lst in contracts.items():
         pack[k] = torch.stack(lst, dim=0)
+    for k, lst in sketches.items():
+        pack[k] = torch.stack(lst, dim=0)
     pack["meta"] = {
         "n": args.n,
         "parse_files": files,
@@ -445,6 +467,7 @@ def build_code_context_pack(args, cfg: AssemblerConfig) -> Dict[str, Any]:
         "ast_records": len(ast_records),
         "core_primitives": CORE_PRIM,
         "truth_level": "code_context_matrix_program_flow_targets",
+        "program_sketch_keys": list(sketches.keys()),
     }
     return pack, records, ast_records
 

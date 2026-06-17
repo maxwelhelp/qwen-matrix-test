@@ -22,7 +22,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -35,6 +35,7 @@ if str(ROOT) not in sys.path:
 from matrix_program_core.assembler_core import (  # noqa: E402
     AssemblerConfig,
     MatrixProgramAssemblerCore,
+    PHASES,
     assembler_skill_loss,
 )
 from matrix_program_core.task_context_v2 import (  # noqa: E402
@@ -62,37 +63,164 @@ from simple_butterfly_matrix.simple_butterfly_matrix import (  # noqa: E402
 )
 
 
+def phase_slot_matrix(layers: int, steps: int, blocks: int, device: torch.device, normalize_rows: bool) -> torch.Tensor:
+    """Map assembler output slots to program phases.
+
+    MatrixProgramAssemblerCore returns one slot per layer/step/block update:
+    [L0.S0.B*, L0.S1.B*, L1.S0.B*, ...]. There is no hard routing here; this
+    map is only a soft structural prior for class reads.
+    """
+
+    phase_ids: List[int] = []
+    phase_count = len(PHASES)
+    for layer in range(int(layers)):
+        phase = min(layer, phase_count - 1)
+        for _step in range(int(steps)):
+            phase_ids.extend([phase] * int(blocks))
+    mat = torch.zeros(phase_count, len(phase_ids), device=device)
+    for slot, phase in enumerate(phase_ids):
+        mat[phase, slot] = 1.0
+    if normalize_rows:
+        mat = mat / mat.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    return mat
+
+
+def class_phase_prior(classes: int) -> torch.Tensor:
+    """Weak class/phase start prior copied from the v3 behavior.
+
+    It does not assign classes to paths. It only breaks the symmetry where every
+    class starts by reading the same aggregate slots.
+    """
+
+    phase_count = len(PHASES)
+    p = torch.zeros(classes, phase_count)
+    for c in range(classes):
+        mode = c % 4
+        if mode == 0:
+            vals = {"compare": 0.45, "suppress": 0.35, "aggregate": 0.25}
+        elif mode == 1:
+            vals = {"extract": 0.35, "compare": 0.35, "suppress": 0.30}
+        elif mode == 2:
+            vals = {"extract": 0.45, "aggregate": 0.30, "compare": 0.20}
+        else:
+            vals = {"compare": 0.30, "suppress": 0.35, "aggregate": 0.25}
+        for name, value in vals.items():
+            if name in PHASES:
+                p[c, PHASES.index(name)] = value
+    if "extract" in PHASES:
+        p[:, PHASES.index("extract")] += 0.08
+    return p
+
+
 class AudioAssemblerHead(nn.Module):
-    def __init__(self, dim: int, classes: int, dropout: float = 0.05):
+    def __init__(
+        self,
+        cfg: AssemblerConfig,
+        dim: int,
+        classes: int,
+        dropout: float = 0.05,
+        pair_slots: int = 12,
+        phase_prior_strength: float = 0.85,
+    ):
         super().__init__()
+        self.cfg = cfg
+        self.dim = int(dim)
         self.classes = int(classes)
-        self.query = nn.Parameter(torch.randn(classes, dim) * 0.04)
-        self.key = nn.Linear(dim, dim, bias=False)
-        self.value = nn.Linear(dim, dim, bias=False)
-        self.update = nn.Sequential(
-            nn.LayerNorm(dim * 3),
-            nn.Linear(dim * 3, dim * 2),
+        self.pair_slots = int(pair_slots)
+        self.phase_prior_strength = float(phase_prior_strength)
+
+        self.class_state = nn.Parameter(torch.randn(classes, dim) * 0.05)
+        self.class_phase_logits = nn.Parameter(class_phase_prior(classes))
+        self.pair_state = nn.Parameter(torch.randn(self.pair_slots, dim) * 0.04)
+        self.class_pair_logits = nn.Parameter(torch.randn(classes, self.pair_slots) * 0.04)
+
+        self.key_w = nn.Parameter(torch.randn(dim, dim) * 0.04)
+        self.value_w = nn.Parameter(torch.randn(dim, dim) * 0.04)
+        self.class_q = nn.Parameter(torch.randn(dim, dim) * 0.04)
+        self.pair_q = nn.Parameter(torch.randn(dim, dim) * 0.04)
+        self.pair_k = nn.Parameter(torch.randn(dim, dim) * 0.04)
+        self.pair_v = nn.Parameter(torch.randn(dim, dim) * 0.04)
+
+        self.class_update = nn.Sequential(
+            nn.LayerNorm(dim * 5),
+            nn.Linear(dim * 5, dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(dim * 2, dim),
         )
-        self.norm = nn.LayerNorm(dim)
+        self.class_norm = nn.LayerNorm(dim)
         self.logit_w = nn.Parameter(torch.randn(classes, dim) * 0.04)
         self.logit_bias = nn.Parameter(torch.zeros(classes))
+        self.write_logit = nn.Parameter(torch.tensor(-0.35))
+        self.drop = nn.Dropout(dropout)
+
+    @property
+    def query(self) -> torch.Tensor:
+        return self.class_state
 
     def forward(self, slots: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        q = self.query.to(device=slots.device, dtype=slots.dtype)
-        k = self.key(slots)
-        v = self.value(slots)
-        score = torch.einsum("cd,nsd->ncs", q, k) / math.sqrt(slots.shape[-1])
+        batch, slot_count, dim = slots.shape
+        phase_map_prior = phase_slot_matrix(
+            self.cfg.layers,
+            self.cfg.steps,
+            self.cfg.blocks,
+            slots.device,
+            normalize_rows=True,
+        ).to(slots.dtype)
+        phase_map_mass = phase_slot_matrix(
+            self.cfg.layers,
+            self.cfg.steps,
+            self.cfg.blocks,
+            slots.device,
+            normalize_rows=False,
+        ).to(slots.dtype)
+        if phase_map_prior.shape[1] != slot_count:
+            phase_map_prior = F.interpolate(
+                phase_map_prior.unsqueeze(0),
+                size=slot_count,
+                mode="linear",
+                align_corners=False,
+            ).squeeze(0)
+            phase_map_prior = phase_map_prior / phase_map_prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            phase_map_mass = phase_map_prior * float(slot_count) / float(max(1, len(PHASES)))
+
+        phase_w = torch.softmax(self.class_phase_logits.float(), dim=-1).to(slots.dtype)
+        slot_prior = torch.matmul(phase_w, phase_map_prior).clamp_min(1e-8)
+
+        keys = slots @ self.key_w.to(device=slots.device, dtype=slots.dtype)
+        values = self.drop(slots @ self.value_w.to(device=slots.device, dtype=slots.dtype))
+        q = self.class_state.to(device=slots.device, dtype=slots.dtype) @ self.class_q.to(device=slots.device, dtype=slots.dtype)
+        score = torch.einsum("cd,nsd->ncs", q, keys) / math.sqrt(dim)
+        score = score + self.phase_prior_strength * slot_prior.log().view(1, self.classes, slot_count)
         attn = torch.softmax(score.float(), dim=-1).to(slots.dtype)
-        read = torch.einsum("ncs,nsd->ncd", attn, v)
-        global_read = slots.mean(dim=1, keepdim=True).expand_as(read)
-        cls_state = q.view(1, self.classes, -1).expand(slots.shape[0], -1, -1)
-        h = self.norm(cls_state + self.update(torch.cat([cls_state, read, global_read], dim=-1)))
-        logits = (h * self.logit_w.to(device=slots.device, dtype=slots.dtype).view(1, self.classes, -1)).sum(dim=-1)
+        class_read = torch.einsum("ncs,nsd->ncd", attn, values)
+
+        pair_w = torch.softmax(self.class_pair_logits.float(), dim=-1).to(slots.dtype)
+        pair_base = torch.matmul(pair_w, self.pair_state.to(device=slots.device, dtype=slots.dtype))
+        pair_q = class_read @ self.pair_q.to(device=slots.device, dtype=slots.dtype)
+        pair_k = pair_base @ self.pair_k.to(device=slots.device, dtype=slots.dtype)
+        pair_score = torch.einsum("ncd,ed->nce", pair_q, pair_k) / math.sqrt(dim)
+        pair_attn = torch.softmax(pair_score.float(), dim=-1).to(slots.dtype)
+        pair_v = pair_base @ self.pair_v.to(device=slots.device, dtype=slots.dtype)
+        pair_ctx = torch.einsum("nce,ed->ncd", pair_attn, pair_v)
+
+        cls = self.class_state.to(device=slots.device, dtype=slots.dtype).view(1, self.classes, dim).expand(batch, -1, -1)
+        delta = self.class_update(torch.cat([cls, class_read, pair_ctx, cls * class_read, class_read - pair_ctx], dim=-1))
+        write = torch.sigmoid(self.write_logit.to(device=slots.device, dtype=slots.dtype))
+        class_next = self.class_norm(cls + write * self.drop(delta))
+        logits = (class_next * class_read * self.logit_w.to(device=slots.device, dtype=slots.dtype).view(1, self.classes, dim)).sum(dim=-1)
         logits = logits + self.logit_bias.to(device=slots.device, dtype=slots.dtype)
-        return logits, {"class_slot_attention": attn.detach(), "class_read": read.detach()}
+
+        phase_mass = torch.einsum("ncs,ps->ncp", attn.float(), phase_map_mass.float())
+        return logits, {
+            "class_slot_attention": attn,
+            "class_phase_mass": phase_mass,
+            "class_read": class_read,
+            "class_next": class_next,
+            "pair_attention": pair_attn,
+            "pair_update_norm": pair_ctx.float().norm(dim=-1).mean(),
+            "class_write": write.float(),
+        }
 
 
 class AudioMechanismContextAdapter(nn.Module):
@@ -159,7 +287,14 @@ class AudioAssemblerModel(nn.Module):
             use_deltas=True,
         )
         self.assembler_core = MatrixProgramAssemblerCore(cfg)
-        self.head = AudioAssemblerHead(args.dim, classes, args.head_dropout)
+        self.head = AudioAssemblerHead(
+            cfg,
+            args.dim,
+            classes,
+            args.head_dropout,
+            pair_slots=args.pair_slots,
+            phase_prior_strength=args.phase_prior_strength,
+        )
         self.use_mechanism_context = bool(getattr(args, "use_mechanism_context", False))
         self.mechanism_builder = MechanismEvidenceBuilder(cfg, args.dim, dropout=args.dropout) if self.use_mechanism_context else None
         self.mechanism_adapter = AudioMechanismContextAdapter(cfg, args.dim) if self.use_mechanism_context else None
@@ -373,6 +508,44 @@ def class_read_diversity_loss(attn: torch.Tensor) -> torch.Tensor:
     return F.relu(offdiag - 0.25).mean()
 
 
+def class_slot_prior(attn: torch.Tensor, sigma: float) -> torch.Tensor:
+    # Fixed soft windows over slots break the uniform-attention symmetry while
+    # keeping all reads dense and differentiable.
+    _, C, S = attn.shape
+    slots = torch.arange(S, device=attn.device, dtype=torch.float32).view(1, S)
+    centers = (torch.arange(C, device=attn.device, dtype=torch.float32) + 0.5) * (float(S) / float(C))
+    centers = centers.view(C, 1)
+    sigma_t = torch.tensor(max(0.5, float(sigma)), device=attn.device, dtype=torch.float32)
+    dist = (slots - centers).abs()
+    dist = torch.minimum(dist, torch.tensor(float(S), device=attn.device) - dist)
+    prior = torch.softmax(-0.5 * (dist / sigma_t).pow(2), dim=-1)
+    return prior
+
+
+def class_slot_prior_loss(attn: torch.Tensor, sigma: float) -> torch.Tensor:
+    a = attn.float().mean(dim=0).clamp_min(1e-8)
+    prior = class_slot_prior(attn, sigma)
+    return -(prior * a.log()).sum(dim=-1).mean()
+
+
+def class_attention_entropy(attn: torch.Tensor) -> torch.Tensor:
+    a = attn.float().mean(dim=0).clamp_min(1e-8)
+    a = a / a.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    return -(a * a.log()).sum(dim=-1).mean()
+
+
+def phase_balance_loss(phase_mass: torch.Tensor, min_early: float, max_aggregate: float) -> torch.Tensor:
+    usage = phase_mass.float().mean(dim=(0, 1))
+    if usage.numel() <= 1:
+        return torch.zeros((), device=usage.device)
+    early = usage[:-1]
+    early_loss = F.relu(torch.tensor(float(min_early), device=usage.device) - early).pow(2).mean()
+    agg_loss = F.relu(usage[-1] - float(max_aggregate)).pow(2)
+    ent = -(usage.clamp_min(1e-8) * usage.clamp_min(1e-8).log()).sum()
+    ent_floor = F.relu(torch.tensor(1.15, device=usage.device) - ent).pow(2)
+    return early_loss + agg_loss + 0.25 * ent_floor
+
+
 def slot_diversity_loss(slots: torch.Tensor) -> torch.Tensor:
     s = slots.float().mean(dim=0)
     s = F.normalize(s, dim=-1)
@@ -394,8 +567,13 @@ def aux_losses(logits: torch.Tensor, aux, haux, args, flow_targets, skill_weight
     out["write_budget"] = (gate.mean() - args.write_target).pow(2) if gate.numel() else torch.zeros((), device=logits.device)
     out["update_alive"] = F.relu(torch.tensor(float(args.min_update_norm), device=logits.device) - upd.mean()).pow(2) if upd.numel() else torch.zeros((), device=logits.device)
     out["class_read_div"] = class_read_diversity_loss(haux["class_slot_attention"])
+    out["class_slot_prior"] = class_slot_prior_loss(haux["class_slot_attention"], args.class_slot_prior_sigma)
+    out["class_attn_entropy"] = class_attention_entropy(haux["class_slot_attention"])
+    out["phase_balance"] = phase_balance_loss(haux["class_phase_mass"], args.min_early_phase_mass, args.max_aggregate_phase_mass)
     out["slot_div"] = slot_diversity_loss(aux.slots)
     out["logit_norm"] = logits.float().pow(2).mean()
+    out["pair_update_norm"] = haux["pair_update_norm"].float()
+    out["class_write"] = haux["class_write"].float()
     return out
 
 
@@ -419,6 +597,9 @@ def train_epoch(model, loader, opt, scaler, device, dtype, args, epoch: int, flo
             loss = loss + args.lambda_write_budget * losses["write_budget"]
             loss = loss + args.lambda_update_alive * losses["update_alive"]
             loss = loss + args.lambda_class_read_div * losses["class_read_div"]
+            loss = loss + args.lambda_class_slot_prior * losses["class_slot_prior"]
+            loss = loss + args.lambda_class_attn_entropy * losses["class_attn_entropy"]
+            loss = loss + args.lambda_phase_balance * losses["phase_balance"]
             loss = loss + args.lambda_slot_div * losses["slot_div"]
             loss = loss + args.lambda_logit_norm * losses["logit_norm"]
         if not torch.isfinite(loss):
@@ -475,6 +656,12 @@ def evaluate(model, loader, device, dtype, args, flow_targets, skill_weights):
             "memory_usage": float(aux.memory_usage.detach().cpu()),
             "global_usage": float(aux.global_usage.detach().cpu()),
             "entropy": {k: float(v.detach().cpu()) for k, v in aux.entropies.items()},
+            "phase_mass_mean": {
+                PHASES[i]: float(haux["class_phase_mass"].float().mean(dim=(0, 1))[i].detach().cpu())
+                for i in range(len(PHASES))
+            },
+            "pair_update_norm": float(haux["pair_update_norm"].detach().cpu()),
+            "class_write": float(haux["class_write"].detach().cpu()),
             "slot_count": len(aux.slot_names),
             "cell_names": aux.cell_names,
         }
@@ -537,7 +724,8 @@ def run(args) -> None:
     fields = [
         "epoch", "train_loss", "train_ce", "train_acc", "val_loss", "val_acc", "best_acc",
         "skill", "read_flow_kl", "primitive_slot_kl", "slot_transition_kl", "primitive_transition_kl", "slot_composition_kl", "write_flow_kl",
-        "write_budget", "update_alive", "class_read_div", "slot_div", "logit_norm",
+        "write_budget", "update_alive", "class_read_div", "class_slot_prior", "class_attn_entropy", "phase_balance", "slot_div", "logit_norm",
+        "pair_update_norm", "class_write",
     ]
     with (out_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=fields).writeheader()
@@ -628,6 +816,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--memory-cells", type=int, default=4)
     p.add_argument("--global-cells", type=int, default=2)
     p.add_argument("--channel-stages", type=int, default=3)
+    p.add_argument("--pair-slots", type=int, default=12)
     p.add_argument("--dropout", type=float, default=0.04)
     p.add_argument("--head-dropout", type=float, default=0.05)
     p.add_argument("--epochs", type=int, default=3)
@@ -640,10 +829,17 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--grad-clip", type=float, default=0.75)
     p.add_argument("--write-target", type=float, default=0.44)
     p.add_argument("--min-update-norm", type=float, default=0.20)
+    p.add_argument("--phase-prior-strength", type=float, default=0.85)
+    p.add_argument("--min-early-phase-mass", type=float, default=0.07)
+    p.add_argument("--max-aggregate-phase-mass", type=float, default=0.42)
     p.add_argument("--lambda-skill", type=float, default=0.0)
     p.add_argument("--lambda-write-budget", type=float, default=0.025)
     p.add_argument("--lambda-update-alive", type=float, default=0.005)
     p.add_argument("--lambda-class-read-div", type=float, default=0.020)
+    p.add_argument("--lambda-class-slot-prior", type=float, default=0.030)
+    p.add_argument("--lambda-class-attn-entropy", type=float, default=0.003)
+    p.add_argument("--lambda-phase-balance", type=float, default=0.045)
+    p.add_argument("--class-slot-prior-sigma", type=float, default=1.45)
     p.add_argument("--lambda-slot-div", type=float, default=0.002)
     p.add_argument("--lambda-logit-norm", type=float, default=0.0007)
     p.add_argument("--w-read", type=float, default=0.25)

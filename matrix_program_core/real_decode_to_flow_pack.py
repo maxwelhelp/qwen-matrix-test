@@ -117,19 +117,33 @@ def rec_to_flows(rec: Dict[str, Any], cfg: AssemblerConfig) -> Dict[str, torch.T
     return dict(read_flow=cc.normalize_last(read), primitive_slot_flow=cc.normalize_last(prim), slot_transition_flow=cc.normalize_last(slot), primitive_transition_flow=cc.normalize_last(ptr), slot_composition_flow=cc.normalize_last(comp), write_flow=cc.normalize_last(write))
 
 
+def flow_sketch(ft: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {
+        "primitive_hist": ft["primitive_slot_flow"].float().mean(dim=(0, 1, 2)),
+        "primitive_transition_hist": ft["primitive_transition_flow"].float().mean(dim=0).flatten(),
+        "read_hist": ft["read_flow"].float().mean(dim=(0, 1, 2)),
+        "write_hist": ft["write_flow"].float().mean(dim=(0, 1)),
+        "slot_transition_hist": ft["slot_transition_flow"].float().mean(dim=(0, 1)).flatten(),
+        "composition_hist": ft["slot_composition_flow"].float().mean(dim=(0, 1)),
+    }
+
+
 def build_pack(records: Sequence[Dict[str, Any]], cfg: AssemblerConfig) -> Dict[str, Any]:
     flows = {k: [] for k in ("read_flow", "primitive_slot_flow", "slot_transition_flow", "primitive_transition_flow", "slot_composition_flow", "write_flow")}
+    sketches = {k: [] for k in ("primitive_hist", "primitive_transition_hist", "read_hist", "write_hist", "slot_transition_hist", "composition_hist")}
     ctx = {k: [] for k in ("role_id", "input_kind_id", "output_kind_id", "loss_kind_id", "readout_kind_id", "num_outputs", "sequence_length", "hidden_dim", "extra_scalar")}
     for rec in records:
         ft = rec_to_flows(rec, cfg)
         for k, v in ft.items(): flows[k].append(v)
+        for k, v in flow_sketch(ft).items(): sketches[k].append(v)
         c = role_contract(rec.get("role_guess", "linear"), rec.get("original_shape"))
         met = rec.get("metrics", {}) or {}
         c["extra_scalar"] = float(c["extra_scalar"]) + float(met.get("rec_err", 0.0)) + float(met.get("functional_err_gaussian", 0.0))
         for k, v in c.items(): ctx[k].append(torch.tensor(v, dtype=torch.long if k.endswith("_id") else torch.float32))
     pack: Dict[str, Any] = {k: torch.stack(v) for k, v in flows.items()}
+    pack.update({k: torch.stack(v) for k, v in sketches.items()})
     pack.update({k: torch.stack(v) for k, v in ctx.items()})
-    pack["meta"] = {"truth_level": "real_weight_program_decode_to_assembler_flow", "n": len(records), "primitives": P}
+    pack["meta"] = {"truth_level": "real_weight_program_decode_to_assembler_flow", "n": len(records), "primitives": P, "program_sketch_keys": list(sketches.keys())}
     return pack
 
 

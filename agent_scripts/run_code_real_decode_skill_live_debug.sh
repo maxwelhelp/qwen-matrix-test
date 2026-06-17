@@ -32,6 +32,14 @@ AUDIO_MODES="${AUDIO_MODES:-delta freeze_core full}"
 N_CODE="${N_CODE:-4000}"
 LOG_EVERY="${LOG_EVERY:-50}"
 AUDIO_LAMBDA_SKILL="${AUDIO_LAMBDA_SKILL:-0.001}"
+AUDIO_LR="${AUDIO_LR:-3e-4}"
+AUDIO_CLASS_READ_DIV="${AUDIO_CLASS_READ_DIV:-0.04}"
+AUDIO_CLASS_SLOT_PRIOR="${AUDIO_CLASS_SLOT_PRIOR:-0.0}"
+AUDIO_CLASS_ATTN_ENTROPY="${AUDIO_CLASS_ATTN_ENTROPY:-0.003}"
+AUDIO_PHASE_PRIOR_STRENGTH="${AUDIO_PHASE_PRIOR_STRENGTH:-0.85}"
+AUDIO_LAMBDA_PHASE_BALANCE="${AUDIO_LAMBDA_PHASE_BALANCE:-0.03}"
+AUDIO_PAIR_SLOTS="${AUDIO_PAIR_SLOTS:-12}"
+AUDIO_SLOT_DIV="${AUDIO_SLOT_DIV:-0.003}"
 TRAIN_TASK_CONTEXT="${TRAIN_TASK_CONTEXT:-1}"
 AMP_SKILL="${AMP_SKILL:-fp32}"
 AMP_AUDIO="${AMP_AUDIO:-fp32}"
@@ -130,14 +138,23 @@ python - "$MERGED_PACK" "$CODE_PACK" ${REAL_PACK:+"$REAL_PACK"} <<'PY'
 import sys, json, torch
 from pathlib import Path
 out = Path(sys.argv[1]); paths = [Path(p) for p in sys.argv[2:] if p]
-keys = ["read_flow","primitive_slot_flow","slot_transition_flow","primitive_transition_flow","slot_composition_flow","write_flow","role_id","input_kind_id","output_kind_id","loss_kind_id","readout_kind_id","num_outputs","sequence_length","hidden_dim","extra_scalar"]
+keys = [
+    "read_flow","primitive_slot_flow","slot_transition_flow","primitive_transition_flow","slot_composition_flow","write_flow",
+    "role_id","input_kind_id","output_kind_id","loss_kind_id","readout_kind_id","num_outputs","sequence_length","hidden_dim","extra_scalar",
+    "primitive_hist","primitive_transition_hist","read_hist","write_hist","slot_transition_hist","composition_hist",
+]
 packs = [torch.load(p, map_location="cpu") for p in paths]
 merged = {}
 for k in keys:
     vals = [p[k] for p in packs if k in p]
     if vals:
         merged[k] = torch.cat(vals, dim=0)
-merged["meta"] = {"truth_level":"code_context_plus_real_decode_flow_pack", "inputs":[str(p) for p in paths], "n": int(merged["read_flow"].shape[0])}
+merged["meta"] = {
+    "truth_level":"code_context_plus_real_decode_flow_pack",
+    "inputs":[str(p) for p in paths],
+    "n": int(merged["read_flow"].shape[0]),
+    "program_sketch_keys":[k for k in keys if k.endswith("_hist")],
+}
 out.parent.mkdir(parents=True, exist_ok=True)
 torch.save(merged, out)
 print(json.dumps(merged["meta"], ensure_ascii=False, indent=2))
@@ -179,8 +196,13 @@ for MODE in $AUDIO_MODES; do
     --train-limit 12000 --val-limit 2000 \
     --batch-size 128 --eval-batch-size 256 --workers 4 --pin-memory \
     --dim 96 --evidence-cells 48 --layers 4 --blocks 4 --steps 2 --primitive-slots 4 --memory-cells 4 --global-cells 2 --channel-stages 3 \
-    --epochs "$EPOCHS_AUDIO" --lr 3e-4 \
-    --lambda-skill "$AUDIO_LAMBDA_SKILL" --lambda-write-budget 0.025 --lambda-update-alive 0.005 --lambda-logit-norm 0.0007 \
+    --epochs "$EPOCHS_AUDIO" --lr "$AUDIO_LR" \
+    --lambda-skill "$AUDIO_LAMBDA_SKILL" --lambda-write-budget 0.025 --lambda-update-alive 0.005 \
+    --pair-slots "$AUDIO_PAIR_SLOTS" --phase-prior-strength "$AUDIO_PHASE_PRIOR_STRENGTH" \
+    --lambda-phase-balance "$AUDIO_LAMBDA_PHASE_BALANCE" \
+    --lambda-class-read-div "$AUDIO_CLASS_READ_DIV" \
+    --lambda-class-slot-prior "$AUDIO_CLASS_SLOT_PRIOR" --lambda-class-attn-entropy "$AUDIO_CLASS_ATTN_ENTROPY" \
+    --lambda-slot-div "$AUDIO_SLOT_DIV" --lambda-logit-norm 0.0007 \
     --grad-clip 0.75 --log-every 25
   python matrix_program_core/checkpoint_split.py --input "$OUT/best.pt" --out-dir "$EXPORT_ROOT" --tag "audio_${MODE}"
   cp "$OUT/final_report.json" "$REPORT_DIR/audio_${MODE}_final_report.json" || true

@@ -41,3 +41,18 @@ cache/
 matrix_program_core/runs/
 neural_matrix_program_dataset_v3/runs/
 agent_reports/
+
+# heavy local artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+*.npy
+*.npz
+*.zip
+*.tar
+*.tar.gz
+matrix_program_core/runs/
+neural_matrix_program_dataset_v3/runs/

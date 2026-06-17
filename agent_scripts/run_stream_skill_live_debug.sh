@@ -25,6 +25,12 @@ AMP_AUDIO="${AMP_AUDIO:-fp32}"
 TRAIN_TASK_CONTEXT="${TRAIN_TASK_CONTEXT:-0}"
 USE_MECHANISM_CONTEXT="${USE_MECHANISM_CONTEXT:-0}"
 AUDIO_LAMBDA_SKILL="${AUDIO_LAMBDA_SKILL:-0}"
+AUDIO_LR="${AUDIO_LR:-3e-4}"
+AUDIO_CLASS_READ_DIV="${AUDIO_CLASS_READ_DIV:-0.08}"
+AUDIO_CLASS_SLOT_PRIOR="${AUDIO_CLASS_SLOT_PRIOR:-0.03}"
+AUDIO_CLASS_ATTN_ENTROPY="${AUDIO_CLASS_ATTN_ENTROPY:-0.003}"
+AUDIO_CLASS_SLOT_SIGMA="${AUDIO_CLASS_SLOT_SIGMA:-1.45}"
+AUDIO_SLOT_DIV="${AUDIO_SLOT_DIV:-0.01}"
 STREAM_TRAIN_MODE="${STREAM_TRAIN_MODE:-editor_delta}"
 STREAM_LR="${STREAM_LR:-2e-4}"
 NOISE_MIN="${NOISE_MIN:-0.15}"
@@ -100,8 +106,12 @@ for MODE in $AUDIO_MODES; do
     --train-limit 12000 --val-limit 2000 \
     --batch-size 128 --eval-batch-size 256 --workers 4 --pin-memory \
     --dim 96 --evidence-cells 48 --layers 4 --blocks 4 --steps 2 --primitive-slots 4 --memory-cells 4 --global-cells 2 --channel-stages 3 \
-    --epochs "$EPOCHS_AUDIO" --lr 3e-4 \
-    --lambda-skill "$AUDIO_LAMBDA_SKILL" --lambda-write-budget 0.025 --lambda-update-alive 0.005 --lambda-logit-norm 0.0007 \
+    --epochs "$EPOCHS_AUDIO" --lr "$AUDIO_LR" \
+    --lambda-skill "$AUDIO_LAMBDA_SKILL" --lambda-write-budget 0.025 --lambda-update-alive 0.005 \
+    --lambda-class-read-div "$AUDIO_CLASS_READ_DIV" \
+    --lambda-class-slot-prior "$AUDIO_CLASS_SLOT_PRIOR" --lambda-class-attn-entropy "$AUDIO_CLASS_ATTN_ENTROPY" \
+    --class-slot-prior-sigma "$AUDIO_CLASS_SLOT_SIGMA" \
+    --lambda-slot-div "$AUDIO_SLOT_DIV" --lambda-logit-norm 0.0007 \
     --grad-clip 0.75 --log-every 25
   python matrix_program_core/checkpoint_split.py --input "$OUT/best.pt" --out-dir "$EXPORT_ROOT" --tag "audio_${MODE}"
   cp "$OUT/final_report.json" "$REPORT_DIR/audio_${MODE}_final_report.json" || true
@@ -143,7 +153,7 @@ REPORT="$REPORT_DIR/REPORT_TO_CHATGPT.txt"
   echo
   echo "## git"; git rev-parse HEAD 2>/dev/null || true; git status --short 2>/dev/null || true
   echo
-  echo "## config"; echo "DATASET=$DATASET"; echo "INIT_ASSEMBLER=$INIT_ASSEMBLER"; echo "STREAM_CKPT=$STREAM_CKPT"; echo "EPOCHS_STREAM=$EPOCHS_STREAM"; echo "EPOCHS_AUDIO=$EPOCHS_AUDIO"; echo "AUDIO_MODES=$AUDIO_MODES"; echo "STREAM_TRAIN_MODE=$STREAM_TRAIN_MODE"; echo "TRAIN_TASK_CONTEXT=$TRAIN_TASK_CONTEXT"; echo "USE_MECHANISM_CONTEXT=$USE_MECHANISM_CONTEXT"; echo "NOISE_MIN=$NOISE_MIN"; echo "NOISE_MAX=$NOISE_MAX"; echo "REPAIR_MIN=$REPAIR_MIN"; echo "REPAIR_MAX=$REPAIR_MAX"
+  echo "## config"; echo "DATASET=$DATASET"; echo "INIT_ASSEMBLER=$INIT_ASSEMBLER"; echo "STREAM_CKPT=$STREAM_CKPT"; echo "EPOCHS_STREAM=$EPOCHS_STREAM"; echo "EPOCHS_AUDIO=$EPOCHS_AUDIO"; echo "AUDIO_MODES=$AUDIO_MODES"; echo "STREAM_TRAIN_MODE=$STREAM_TRAIN_MODE"; echo "TRAIN_TASK_CONTEXT=$TRAIN_TASK_CONTEXT"; echo "USE_MECHANISM_CONTEXT=$USE_MECHANISM_CONTEXT"; echo "AUDIO_LR=$AUDIO_LR"; echo "AUDIO_CLASS_READ_DIV=$AUDIO_CLASS_READ_DIV"; echo "AUDIO_CLASS_SLOT_PRIOR=$AUDIO_CLASS_SLOT_PRIOR"; echo "AUDIO_CLASS_ATTN_ENTROPY=$AUDIO_CLASS_ATTN_ENTROPY"; echo "AUDIO_CLASS_SLOT_SIGMA=$AUDIO_CLASS_SLOT_SIGMA"; echo "AUDIO_SLOT_DIV=$AUDIO_SLOT_DIV"; echo "NOISE_MIN=$NOISE_MIN"; echo "NOISE_MAX=$NOISE_MAX"; echo "REPAIR_MIN=$REPAIR_MIN"; echo "REPAIR_MAX=$REPAIR_MAX"
   echo
   echo "## summary"; cat "$REPORT_DIR/summary.txt"
   echo
