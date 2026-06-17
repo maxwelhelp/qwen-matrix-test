@@ -4,16 +4,15 @@ __pycache__/
 venv/
 .env
 .env.*
-.secrets/
 
-*.log
 runs/
 outputs/
 checkpoints/
-wandb/
 data/
 datasets/
-downloaded/
+cache/
+.cache/
+*.log
 
 *.pt
 *.pth
@@ -23,3 +22,6 @@ downloaded/
 *.onnx
 *.npy
 *.npz
+*.zip
+*.tar
+*.tar.gz
