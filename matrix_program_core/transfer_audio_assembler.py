@@ -63,6 +63,9 @@ from simple_butterfly_matrix.simple_butterfly_matrix import (  # noqa: E402
 )
 
 
+SEMANTIC_KIND_NAMES = ("READ", "TRANSFORM", "FILTER_GATE", "MEMORY", "GLOBAL", "WRITE")
+
+
 def phase_slot_matrix(layers: int, steps: int, blocks: int, device: torch.device, normalize_rows: bool) -> torch.Tensor:
     """Map assembler output slots to program phases.
 
@@ -675,6 +678,161 @@ def role_similarity_loss(aux, margin: float) -> torch.Tensor:
     return F.relu(off - float(margin)).mean()
 
 
+def _norm_entropy_focus(p: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    p = p.float().clamp_min(1e-8)
+    p = p / p.sum(dim=dim, keepdim=True).clamp_min(1e-8)
+    ent = -(p * p.log()).sum(dim=dim)
+    denom = math.log(float(max(2, p.shape[dim])))
+    return (1.0 - ent / denom).clamp(0.0, 1.0)
+
+
+def semantic_frame_tensors(aux, haux, args) -> Dict[str, torch.Tensor]:
+    # All fields are soft summaries of existing matrix-program flows.
+    # Shapes mostly use [T,N,B] where T=L*S. Nothing here routes execution.
+    read = aux.read_flow.float()
+    prim = aux.primitive_slot_flow.float()
+    write = aux.write_flow.float()
+    T, N, B = int(read.shape[0]), int(read.shape[1]), int(read.shape[2])
+    A = int(read.shape[-1])
+    mem0 = int(args.blocks)
+    glob0 = mem0 + int(args.memory_cells)
+
+    read_addr = read.mean(dim=3)  # [T,N,B,A]
+    read_state = read_addr[..., :mem0].sum(dim=-1) if mem0 > 0 else torch.zeros(T, N, B, device=read.device)
+    read_memory = read_addr[..., mem0:glob0].sum(dim=-1) if int(args.memory_cells) > 0 else torch.zeros(T, N, B, device=read.device)
+    read_global = read_addr[..., glob0:].sum(dim=-1) if int(args.global_cells) > 0 else torch.zeros(T, N, B, device=read.device)
+
+    write_state = write[..., :mem0].sum(dim=-1) if mem0 > 0 else torch.zeros(T, N, B, device=write.device)
+    write_memory = write[..., mem0:glob0].sum(dim=-1) if int(args.memory_cells) > 0 else torch.zeros(T, N, B, device=write.device)
+    write_global = write[..., glob0:].sum(dim=-1) if int(args.global_cells) > 0 else torch.zeros(T, N, B, device=write.device)
+
+    pidx = {name: i for i, name in enumerate(PRIMITIVES)}
+    prim_mass = prim.mean(dim=3)  # [T,N,B,P]
+    def pmass(names: Tuple[str, ...]) -> torch.Tensor:
+        idxs = [pidx[n] for n in names if n in pidx]
+        if not idxs:
+            return torch.zeros(T, N, B, device=prim.device)
+        return prim_mass[..., idxs].sum(dim=-1)
+
+    transform = pmass(("channel_butterfly", "block_butterfly", "low_rank", "ctx_matrix"))
+    filter_gate = pmass(("product_gate", "phase_matrix"))
+
+    read_focus = _norm_entropy_focus(read_addr, dim=-1)
+    write_focus = _norm_entropy_focus(write, dim=-1)
+    primitive_focus = _norm_entropy_focus(prim_mass, dim=-1)
+
+    attn = haux["class_slot_attention"].float()
+    slot_count = T * B
+    if attn.shape[-1] == slot_count:
+        consumer = attn.mean(dim=1).transpose(0, 1).reshape(T, B, N).permute(0, 2, 1)
+    else:
+        consumer = torch.full((T, N, B), 1.0 / float(max(1, slot_count)), device=read.device, dtype=read.dtype)
+
+    kind_raw = torch.stack([
+        read_focus + 0.35 * read_state,
+        transform + 0.35 * primitive_focus,
+        filter_gate,
+        read_memory + write_memory,
+        read_global + write_global,
+        write_focus + 0.35 * write_state,
+    ], dim=-1).clamp_min(1e-8)
+    kind = kind_raw / kind_raw.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    return {
+        "kind": kind,
+        "read_focus": read_focus,
+        "write_focus": write_focus,
+        "primitive_focus": primitive_focus,
+        "read_memory": read_memory,
+        "read_global": read_global,
+        "write_memory": write_memory,
+        "write_global": write_global,
+        "consumer": consumer,
+    }
+
+
+def semantic_transition_loss(kind: torch.Tensor) -> torch.Tensor:
+    if kind.shape[0] <= 1:
+        return torch.zeros((), device=kind.device)
+    C = kind.shape[-1]
+    allowed = torch.tensor([
+        # READ, TRANSFORM, FILTER_GATE, MEMORY, GLOBAL, WRITE
+        [0.30, 0.95, 0.80, 0.75, 0.75, 0.35],  # READ
+        [0.55, 0.75, 0.80, 0.70, 0.70, 0.90],  # TRANSFORM
+        [0.45, 0.90, 0.55, 0.55, 0.55, 0.85],  # FILTER_GATE
+        [0.65, 0.85, 0.65, 0.45, 0.70, 0.80],  # MEMORY
+        [0.65, 0.85, 0.60, 0.65, 0.45, 0.85],  # GLOBAL
+        [0.80, 0.60, 0.45, 0.45, 0.45, 0.35],  # WRITE
+    ], device=kind.device, dtype=kind.dtype)
+    if C != allowed.shape[0]:
+        return torch.zeros((), device=kind.device)
+    a = kind[:-1].mean(dim=(1, 2))
+    b = kind[1:].mean(dim=(1, 2))
+    bad = 1.0 - allowed
+    return torch.einsum("tc,cd,td->t", a, bad, b).mean()
+
+
+def semantic_lint_losses(aux, haux, args) -> Dict[str, torch.Tensor]:
+    sem = semantic_frame_tensors(aux, haux, args)
+    kind = sem["kind"]
+    T, N, B = kind.shape[:3]
+    slot_count = max(1, T * B)
+    consumer_floor = float(args.semantic_dead_slot_frac) / float(slot_count)
+
+    read_focus = sem["read_focus"].mean()
+    primitive_focus = sem["primitive_focus"].mean()
+    memory_global = (sem["read_memory"] + sem["read_global"] + sem["write_memory"] + sem["write_global"]).mean()
+    consumer = sem["consumer"]
+    write_pressure = (sem["write_focus"] + sem["write_memory"] + sem["write_global"]).detach()
+
+    losses: Dict[str, torch.Tensor] = {}
+    losses["semantic_no_read"] = F.relu(torch.tensor(float(args.semantic_min_read_focus), device=kind.device) - read_focus).pow(2)
+    losses["semantic_no_transform"] = F.relu(torch.tensor(float(args.semantic_min_transform_focus), device=kind.device) - primitive_focus).pow(2)
+    losses["semantic_memory_global"] = F.relu(torch.tensor(float(args.semantic_min_memory_global), device=kind.device) - memory_global).pow(2)
+    losses["semantic_dead_slot"] = F.relu(torch.tensor(consumer_floor, device=kind.device) - consumer).mean()
+    losses["semantic_write_consumer"] = (write_pressure * F.relu(torch.tensor(consumer_floor, device=kind.device) - consumer)).mean()
+    if T > 1:
+        early = max(1, T // 3)
+        early_write = (sem["write_memory"][:early] + sem["write_global"][:early]).mean()
+        losses["semantic_early_write"] = early_write.pow(2)
+    else:
+        losses["semantic_early_write"] = torch.zeros((), device=kind.device)
+    losses["semantic_transition"] = semantic_transition_loss(kind)
+    total = torch.zeros((), device=kind.device)
+    for value in losses.values():
+        total = total + value
+    losses["semantic_lint"] = total
+    return losses
+
+
+@torch.no_grad()
+def semantic_report(aux, haux, args) -> Dict[str, object]:
+    sem = semantic_frame_tensors(aux, haux, args)
+    kind = sem["kind"].detach().float()
+    out: Dict[str, object] = {
+        "kind_names": list(SEMANTIC_KIND_NAMES),
+        "kind_usage": kind.mean(dim=(0, 1, 2)).cpu().tolist(),
+        "read_focus": float(sem["read_focus"].mean().detach().cpu()),
+        "write_focus": float(sem["write_focus"].mean().detach().cpu()),
+        "primitive_focus": float(sem["primitive_focus"].mean().detach().cpu()),
+        "memory_global_usage": float((sem["read_memory"] + sem["read_global"] + sem["write_memory"] + sem["write_global"]).mean().detach().cpu()),
+        "consumer_min": float(sem["consumer"].min().detach().cpu()),
+        "consumer_mean": float(sem["consumer"].mean().detach().cpu()),
+    }
+    if getattr(aux, "role_mix", None) is not None:
+        T = kind.shape[0]
+        role = aux.role_mix.detach().float().reshape(T, -1).to(kind.device)
+        kind_t = kind.mean(dim=(1, 2))
+        denom = role.sum(dim=0).clamp_min(1e-8).view(-1, 1)
+        role_kind = torch.einsum("tr,tc->rc", role, kind_t) / denom
+        prim = aux.primitive_slot_flow.detach().float().mean(dim=(1, 2, 3))
+        role_prim = torch.einsum("tr,tp->rp", role, prim.to(kind.device)) / denom
+        out["role_kind"] = role_kind.cpu().tolist()
+        out["role_kind_top"] = [SEMANTIC_KIND_NAMES[int(i)] for i in role_kind.argmax(dim=-1).cpu().tolist()]
+        out["role_primitive_top"] = [PRIMITIVES[int(i)] for i in role_prim.argmax(dim=-1).cpu().tolist()]
+    return out
+
+
 def aux_losses(logits: torch.Tensor, aux, haux, args, flow_targets, skill_weights) -> Dict[str, torch.Tensor]:
     if flow_targets:
         skill, flow_losses = assembler_skill_loss(aux, flow_targets, skill_weights)
@@ -703,6 +861,7 @@ def aux_losses(logits: torch.Tensor, aux, haux, args, flow_targets, skill_weight
     out["role_similarity"] = role_similarity_loss(aux, args.role_similarity_margin)
     out["role_usage_max"] = aux.role_usage.float().max() if getattr(aux, "role_usage", None) is not None else torch.zeros((), device=logits.device)
     out["role_entropy"] = aux.role_entropy.float().mean() if getattr(aux, "role_entropy", None) is not None else torch.zeros((), device=logits.device)
+    out.update(semantic_lint_losses(aux, haux, args))
     out["logit_norm"] = logits.float().pow(2).mean()
     out["pair_update_norm"] = haux["pair_update_norm"].float()
     out["class_write"] = haux["class_write"].float()
@@ -742,6 +901,7 @@ def train_epoch(model, loader, opt, scaler, device, dtype, args, epoch: int, flo
             loss = loss + args.lambda_role_usage_balance * losses["role_usage_balance"]
             loss = loss + args.lambda_role_entropy_band * losses["role_entropy_band"]
             loss = loss + args.lambda_role_similarity * losses["role_similarity"]
+            loss = loss + args.lambda_semantic_lint * losses["semantic_lint"]
             loss = loss + args.lambda_logit_norm * losses["logit_norm"]
         if not torch.isfinite(loss):
             print("NONFINITE_LOSS skip", flush=True)
@@ -801,6 +961,7 @@ def evaluate(model, loader, device, dtype, args, flow_targets, skill_weights):
             "role_mix": aux.role_mix.detach().cpu().tolist() if getattr(aux, "role_mix", None) is not None else None,
             "role_entropy_mean": float(aux.role_entropy.float().mean().detach().cpu()) if getattr(aux, "role_entropy", None) is not None else 0.0,
             "role_similarity": float(aux.role_similarity.detach().cpu()) if getattr(aux, "role_similarity", None) is not None else 0.0,
+            "semantic_frame_summary": semantic_report(aux, haux, args),
             "phase_mass_mean": {
                 PHASES[i]: float(haux["class_phase_mass"].float().mean(dim=(0, 1))[i].detach().cpu())
                 for i in range(len(PHASES))
@@ -872,6 +1033,8 @@ def run(args) -> None:
         "write_budget", "update_alive", "class_read_div", "class_slot_prior", "class_attn_entropy", "phase_balance", "slot_div", "layer_sim", "step_sim",
         "primitive_balance", "cell_balance", "entropy_band", "step_alive_budget",
         "role_usage_balance", "role_entropy_band", "role_similarity", "role_usage_max", "role_entropy",
+        "semantic_lint", "semantic_no_read", "semantic_no_transform", "semantic_memory_global", "semantic_dead_slot",
+        "semantic_write_consumer", "semantic_early_write", "semantic_transition",
         "logit_norm",
         "pair_update_norm", "class_write",
     ]
@@ -1006,6 +1169,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-role-usage-balance", type=float, default=0.000)
     p.add_argument("--lambda-role-entropy-band", type=float, default=0.000)
     p.add_argument("--lambda-role-similarity", type=float, default=0.000)
+    p.add_argument("--lambda-semantic-lint", type=float, default=0.000)
     p.add_argument("--primitive-balance-entropy-floor", type=float, default=0.72)
     p.add_argument("--cell-balance-entropy-floor", type=float, default=0.62)
     p.add_argument("--entropy-band-low", type=float, default=1.05)
@@ -1015,6 +1179,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--role-entropy-low", type=float, default=0.35)
     p.add_argument("--role-entropy-high", type=float, default=0.92)
     p.add_argument("--role-similarity-margin", type=float, default=0.78)
+    p.add_argument("--semantic-min-read-focus", type=float, default=0.04)
+    p.add_argument("--semantic-min-transform-focus", type=float, default=0.06)
+    p.add_argument("--semantic-min-memory-global", type=float, default=0.03)
+    p.add_argument("--semantic-dead-slot-frac", type=float, default=0.35)
     p.add_argument("--lambda-logit-norm", type=float, default=0.0007)
     p.add_argument("--w-read", type=float, default=0.25)
     p.add_argument("--w-primitive", type=float, default=0.30)

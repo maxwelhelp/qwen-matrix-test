@@ -103,3 +103,16 @@ agent_reports/
 matrix_program_core/runs/
 neural_matrix_program_dataset_v3/runs/
 agent_reports/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.bin
+*.onnx
+*.zip
+*.tar
+*.tar.gz
+matrix_program_core/runs/
+agent_reports/

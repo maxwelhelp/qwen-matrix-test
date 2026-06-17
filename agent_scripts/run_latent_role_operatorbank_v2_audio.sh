@@ -22,6 +22,8 @@ AMP_AUDIO="${AMP_AUDIO:-fp32}"
 TRAIN_N="${TRAIN_N:-12000}"
 VAL_N="${VAL_N:-2000}"
 LOG_EVERY="${LOG_EVERY:-25}"
+WORKERS="${WORKERS:-4}"
+PIN_MEMORY="${PIN_MEMORY:-1}"
 LAYERS="${LAYERS:-4}"
 STEPS="${STEPS:-3}"
 BLOCKS="${BLOCKS:-4}"
@@ -44,6 +46,7 @@ STEP_SIM_MARGIN="${STEP_SIM_MARGIN:-0.42}"
 LAMBDA_ROLE_USAGE_BALANCE="${LAMBDA_ROLE_USAGE_BALANCE:-0.010}"
 LAMBDA_ROLE_ENTROPY_BAND="${LAMBDA_ROLE_ENTROPY_BAND:-0.006}"
 LAMBDA_ROLE_SIMILARITY="${LAMBDA_ROLE_SIMILARITY:-0.012}"
+LAMBDA_SEMANTIC_LINT="${LAMBDA_SEMANTIC_LINT:-0.002}"
 ROLE_USAGE_ENTROPY_FLOOR="${ROLE_USAGE_ENTROPY_FLOOR:-0.72}"
 ROLE_ENTROPY_LOW="${ROLE_ENTROPY_LOW:-0.35}"
 ROLE_ENTROPY_HIGH="${ROLE_ENTROPY_HIGH:-0.92}"
@@ -52,10 +55,12 @@ ROLE_SIMILARITY_MARGIN="${ROLE_SIMILARITY_MARGIN:-0.78}"
 printf '\n[latent-role] repo=%s\n' "$ROOT"
 printf '[latent-role] report_dir=%s\n' "$REPORT_DIR"
 printf '[latent-role] modes=%s epochs=%s lr=%s amp=%s\n' "$AUDIO_MODES" "$EPOCHS_AUDIO" "$AUDIO_LR" "$AMP_AUDIO"
+printf '[latent-role] train_n=%s val_n=%s workers=%s pin_memory=%s\n' "$TRAIN_N" "$VAL_N" "$WORKERS" "$PIN_MEMORY"
 printf '[latent-role] architecture: layers=%s steps=%s blocks=%s K=%s memory=%s global=%s dim=%s roles=%s tau=%s\n' \
   "$LAYERS" "$STEPS" "$BLOCKS" "$PRIMITIVE_SLOTS" "$MEMORY_CELLS" "$GLOBAL_CELLS" "$DIM" "$ROLE_COUNT" "$ROLE_TEMPERATURE"
 printf '[latent-role] role losses: usage=%s entropy=%s sim=%s\n\n' \
   "$LAMBDA_ROLE_USAGE_BALANCE" "$LAMBDA_ROLE_ENTROPY_BAND" "$LAMBDA_ROLE_SIMILARITY"
+printf '[latent-role] semantic_lint=%s\n\n' "$LAMBDA_SEMANTIC_LINT"
 
 git rev-parse --short HEAD 2>/dev/null | sed 's/^/[latent-role] git_head=/' || true
 
@@ -67,6 +72,8 @@ for MODE in $AUDIO_MODES; do
   CKPT_ARGS=()
   if [[ -n "$ASSEMBLER_CKPT" ]]; then CKPT_ARGS+=(--assembler-checkpoint "$ASSEMBLER_CKPT"); fi
   if [[ -n "$INIT_CHECKPOINT" ]]; then CKPT_ARGS+=(--init-checkpoint "$INIT_CHECKPOINT"); fi
+  PIN_ARGS=()
+  if [[ "$PIN_MEMORY" == "1" || "$PIN_MEMORY" == "true" || "$PIN_MEMORY" == "yes" ]]; then PIN_ARGS+=(--pin-memory); fi
 
   printf '\n[latent-role] run mode=%s out=%s\n' "$MODE" "$OUT"
   python matrix_program_core/transfer_audio_assembler.py \
@@ -78,7 +85,7 @@ for MODE in $AUDIO_MODES; do
     --device cuda --amp "$AMP_AUDIO" \
     --classes yes,no,up,down,left,right,on,off,stop,go \
     --train-limit "$TRAIN_N" --val-limit "$VAL_N" \
-    --batch-size 128 --eval-batch-size 256 --workers 4 --pin-memory \
+    --batch-size 128 --eval-batch-size 256 --workers "$WORKERS" "${PIN_ARGS[@]}" \
     --dim "$DIM" --evidence-cells "$EVIDENCE_CELLS" \
     --layers "$LAYERS" --steps "$STEPS" --blocks "$BLOCKS" \
     --primitive-slots "$PRIMITIVE_SLOTS" --memory-cells "$MEMORY_CELLS" --global-cells "$GLOBAL_CELLS" \
@@ -102,6 +109,7 @@ for MODE in $AUDIO_MODES; do
     --lambda-role-usage-balance "$LAMBDA_ROLE_USAGE_BALANCE" \
     --lambda-role-entropy-band "$LAMBDA_ROLE_ENTROPY_BAND" \
     --lambda-role-similarity "$LAMBDA_ROLE_SIMILARITY" \
+    --lambda-semantic-lint "$LAMBDA_SEMANTIC_LINT" \
     --role-usage-entropy-floor "$ROLE_USAGE_ENTROPY_FLOOR" \
     --role-entropy-low "$ROLE_ENTROPY_LOW" --role-entropy-high "$ROLE_ENTROPY_HIGH" \
     --role-similarity-margin "$ROLE_SIMILARITY_MARGIN" \
@@ -141,6 +149,8 @@ for f in sorted(rd.glob("audio_*_final_report.json")):
                 "epoch", "train_ce", "train_acc", "val_acc", "best_acc",
                 "class_read_div", "slot_div", "layer_sim", "step_sim",
                 "role_usage_balance", "role_entropy_band", "role_similarity", "role_usage_max", "role_entropy",
+                "semantic_lint", "semantic_no_read", "semantic_no_transform", "semantic_memory_global",
+                "semantic_dead_slot", "semantic_write_consumer", "semantic_early_write", "semantic_transition",
                 "primitive_balance", "cell_balance", "entropy_band", "step_alive_budget",
             ]
             print("last_focus:", {k: rows[-1].get(k) for k in keys})
@@ -155,6 +165,7 @@ REPORT="$REPORT_DIR/REPORT_TO_CHATGPT.txt"
   echo "## config"
   echo "AUDIO_MODES=$AUDIO_MODES"; echo "EPOCHS_AUDIO=$EPOCHS_AUDIO"; echo "AUDIO_LR=$AUDIO_LR"
   echo "LAYERS=$LAYERS"; echo "STEPS=$STEPS"; echo "ROLE_COUNT=$ROLE_COUNT"; echo "ROLE_TEMPERATURE=$ROLE_TEMPERATURE"
+  echo "LAMBDA_SEMANTIC_LINT=$LAMBDA_SEMANTIC_LINT"
   echo
   echo "## summary"; cat "$REPORT_DIR/summary.txt"
   echo
