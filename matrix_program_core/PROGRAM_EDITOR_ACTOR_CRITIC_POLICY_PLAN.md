@@ -1,101 +1,77 @@
-# Editor Actor-Critic Policy Plan
+# Editor Actor-Critic Policy Plan V2
 
-This is the new central-mind plan after the important correction:
+This plan replaces the idea of a single magic central attention head with a real policy loop around the existing matrix-program editor.
 
-> The mind is not one magic attention head above the model.  
-> The mind is a policy loop around the existing editor.
-
-The existing `FlowEditAttention` / editor is already the natural actuator: it edits the matrix-program assembly. The missing piece is a feedback/policy system that teaches the editor where, why, and how strongly to act.
-
-So the real system should be:
+The core correction:
 
 ```text
-Assembler components propose a program
-Editor applies soft edits
-Heldout/critic/counterfactual loop evaluates edits
-Memory stores tested experience
-Critic learns to predict edit gain
-Actor/policy chooses future edit biases
-Components receive editor feedback and memory context
+The editor is the actuator.
+The critic is the first predictive intelligence.
+The memory is tested experience data.
+The probe generates labels by real counterfactual tests.
+The actor is a sparse policy that sends bounded feedback back into the assembly workshops.
+The growth loop promotes repeatedly useful repairs into new reusable macros/operators.
 ```
 
-Everything remains matrix-based and differentiable in the online path.
+Everything that is applied online remains soft, matrix-based, and differentiable.  
+Everything that is remembered as truth must be tested on heldout/counterfactual probes.
 
 ---
 
-## 1. What is the central mind?
+## 1. Why this exists
 
-The central mind is a 5-part loop:
+The current assembler is already differentiable:
 
-1. **Editor / Actuator**
-   - existing flow editor plus future central edit bias.
-   - writes soft biases into read/primitive/transition/write/macro logits.
+```text
+loss -> gradient -> flow logits / editor / head / adapters change
+```
 
-2. **Observer / Trace**
-   - records what the program actually assembled:
-     - read flows;
-     - primitive mixes;
-     - primitive transitions;
-     - slot transitions;
-     - writes;
-     - macro selections;
-     - step/layer roles;
-     - head/class reads;
-     - operator-v2 family choices;
-     - step alive gates.
+So a central mind that only reads `grad * weight` and says “increase what gradient already increases” is not intelligence. It is just a logger for SGD.
 
-3. **Probe / Counterfactual generator**
-   - tests edits that normal gradient may miss:
-     - revive suppressed primitive;
-     - replace macro;
-     - shift read/write;
-     - reduce dominant self-loop;
-     - increase low-rank/product-gate chain;
-     - activate/deactivate step.
+The central mind must add signals a single backprop step does not have:
 
-4. **Critic / Surrogate**
-   - predicts heldout gain and uncertainty:
-
-   ```text
-   critic(context_embedding, edit_embedding) -> mean_gain, uncertainty, risk
-   ```
-
-5. **Memory / Experience Bank**
-   - stores only edits that were actually tested:
-     - accepted;
-     - rejected;
-     - uncertain;
-     - stale/retested.
-
-The actor/policy chooses what the editor should try next, using critic + memory + heldout signal.
+1. cross-run and cross-task memory;
+2. heldout/generalization-aware validation;
+3. counterfactual tests for suppressed components;
+4. uncertainty-aware exploration;
+5. safe deployment with LCB and rollback;
+6. open-ended promotion of new macro/operator recipes.
 
 ---
 
-## 2. Why this is not just SGD
+## 2. Main architecture
 
-SGD only sees the current differentiable path and current train/val batch.
+```text
+Assembler components propose a matrix program
+        ↓
+Editor applies soft edits to assembly logits
+        ↓
+Task/head computes train + heldout signals
+        ↓
+Observer records what was assembled and what editor changed
+        ↓
+Probe tests counterfactual candidate edits
+        ↓
+Memory stores only tested accepted/rejected/uncertain edits
+        ↓
+Critic learns (context, edit) -> heldout_gain + uncertainty + risk
+        ↓
+Actor chooses sparse bounded edit bias
+        ↓
+Feedback bus sends results back into primitive/operator/macro/read/write selectors
+        ↓
+Growth loop promotes repeatedly useful patterns into new macros/operators
+```
 
-This mind adds information SGD does not have:
-
-- cross-run memory;
-- cross-task memory;
-- counterfactual tests for suppressed paths;
-- heldout-gain labels for edits;
-- uncertainty/exploration;
-- trust-region accept/reject;
-- non-stationarity handling;
-- soft-vs-discrete diagnostics;
-- explicit anti-collapse controls.
-
-Naive `grad * weight` is only a diagnostic. It must not be treated as truth.
+This is not one module. It is a closed loop.
 
 ---
 
 ## 3. Existing parts to reuse
 
-### 3.1 Existing editor
+### 3.1 Editor as actuator
 
-Current editor already modifies:
+Current `FlowEditAttention` already edits:
 
 ```text
 read logits
@@ -106,364 +82,258 @@ composition logits
 write logits
 ```
 
-This becomes the main actuator.
+It should become the main actuator, not be replaced.
 
-### 3.2 Existing MacroStepBank
+Future actor outputs must enter as extra bounded biases:
 
-Macro bank is not a primitive. It is a reusable step recipe:
+```text
+flow_logits = base + context + current_editor + macro_bias + feedback_bias + actor_bias
+```
+
+### 3.2 MacroStepBank
+
+Macro is a reusable step recipe, not a primitive:
 
 ```text
 macro = read + primitive mix + transitions + composition + write
 ```
 
-The actor should be able to:
+The actor can:
 
 - activate macro;
 - suppress background macro;
 - replace macro;
 - add small macro delta;
-- promote tested macro variations later.
+- promote tested macro variation later.
 
-### 3.3 Existing OperatorBankV2 idea
+### 3.3 OperatorBankV2
 
-Operator families can be selected softly inside the six external primitive slots:
+The six external primitive families stay compatible, but internally they can contain selectable variants:
 
-- low-rank size;
+- low-rank rank/size;
 - butterfly depth;
-- Haar/wavelet-like variant;
+- Haar/wavelet-like transform;
 - local smooth/diff;
 - diagonal gate;
-- phase variants.
+- phase variants;
+- future Fourier/DCT/Toeplitz variants.
 
-The actor/critic should see these internal operator choices too.
-
----
-
-## 4. The right information flow
-
-Current simplified flow:
-
-```text
-context -> assembler -> program -> loss -> gradient
-```
-
-New flow:
-
-```text
-context
-  -> assembler components
-  -> current program
-  -> editor proposes soft edits
-  -> task/head loss
-  -> trace + counterfactual probes
-  -> heldout gain / risk / noise
-  -> memory record
-  -> critic update
-  -> actor policy
-  -> feedback bias back into assembler components
-```
-
-The key addition is the feedback path:
-
-```text
-editor_result -> feedback_encoder -> primitive/read/write/macro selectors
-```
-
-The selectors should not only see the current data. They should see what the editor tried before and whether it worked.
+The actor/critic must see these internal choices too.
 
 ---
 
-## 5. Where the actor acts
+## 4. Feedback bus into assembly workshops
 
-The actor does not call Python branches. It writes soft matrix biases.
+The most important addition: the editor’s result must return to the components that assemble the program.
 
-### 5.1 Primitive mix
+Assemblers/selectors should not only see raw context. They should also see:
 
 ```text
-primitive_logits[L,S,B,K,P] += actor_primitive_bias[L,S,B,K,P]
+what editor tried here
+whether it helped or hurt
+what critic predicts now
+what memory says for similar contexts
+what downstream slots/classes consumed this component
+whether this component is stale/collapsed/overused
+```
+
+### 4.1 Assembly workshops
+
+Treat each selection site as a workshop:
+
+1. primitive workshop;
+2. operator-size/depth workshop;
+3. primitive-transition workshop;
+4. read workshop;
+5. write workshop;
+6. slot-transition/composition workshop;
+7. macro workshop;
+8. step/layer recipe workshop;
+9. global budget/complexity workshop.
+
+Every workshop receives a projected feedback vector:
+
+```text
+workshop_logits += workshop_feedback_projection(feedback_token)
 ```
 
 Examples:
 
-- increase `product_gate` at compare step;
-- decrease dead `ctx_matrix` self-loop;
-- increase `wavelet/haar` variant in extract step via operator-v2 delta.
-
-### 5.2 Primitive transitions
-
 ```text
-primitive_transition_logits[L,S,P,P] += actor_transition_bias[L,S,P,P]
+primitive_logits[L,S,B,K,P] += feedback_primitive_bias
+operator_variant_logits[L,S,B,K,F,V] += feedback_operator_bias
+primitive_transition_logits[L,S,P,P] += feedback_transition_bias
+read_logits[L,S,B,K,A] += feedback_read_bias
+write_logits[L,S,B,A] += feedback_write_bias
+macro_selector_logits[L,S,B,M] += feedback_macro_bias
+step_alive_logits[L,S] += feedback_step_bias
 ```
 
-Examples:
+### 4.2 Feedback token content
 
-- increase `low_rank -> product_gate`;
-- increase `product_gate -> phase_matrix`;
-- reduce useless `phase_matrix -> phase_matrix` if it is only a lazy self-loop.
-
-### 5.3 Read/write
+For each location/component:
 
 ```text
-read_logits[L,S,B,K,A] += actor_read_bias[L,S,B,K,A]
-write_logits[L,S,B,A] += actor_write_bias[L,S,B,A]
-```
-
-Examples:
-
-- shift read to memory.M2;
-- reduce global read if it harms local extraction;
-- write useful compare result to memory.
-
-### 5.4 Slot transitions/composition
-
-```text
-slot_transition_logits[L,S,B,K,K] += actor_slot_bias[L,S,B,K,K]
-composition_logits[L,S,B,K] += actor_composition_bias[L,S,B,K]
-```
-
-Examples:
-
-- split collapsed slots;
-- make slot K0 carry local feature and K1 carry memory feature;
-- stop all slots averaging the same thing.
-
-### 5.5 Macro selection
-
-```text
-macro_selector_logits[L,S,B,M] += actor_macro_bias[L,S,B,M]
-```
-
-Examples:
-
-- suppress macro_0 background if it dominates;
-- activate macro_7 only in L1.S1.B2;
-- replace macro_3 with macro_12 in suppress layer.
-
-### 5.6 Step/layer/global recipe
-
-```text
-step_alive_logits[L,S] += actor_step_bias[L,S]
-phase_logits[L,S,phase] += actor_phase_bias[L,S,phase]
-```
-
-Examples:
-
-- activate extra compare step;
-- weaken redundant step;
-- make L0 more extract/local;
-- make L3 more aggregate/global.
-
----
-
-## 6. What context every selector must see
-
-The selectors need rich context, not just ID embeddings.
-
-### 6.1 Local object context
-
-For every object:
-
-```text
-object_type
 location: L/S/B/K/A/P/M
-phase role
+component type
 current soft weight
-entropy of its softmax group
-usage count
-step_alive
+entropy of its group
 operator-v2 family weights
 macro id / macro weight
-```
-
-### 6.2 Downstream context
-
-A component matters because something later uses it. Add:
-
-```text
-who reads this slot later
-which class/head reads it
-which memory/global cell receives it
-next-step read histogram
-next-step write histogram
-next-step primitive histogram
-class-slot attention
-per-class loss/confusion
-```
-
-### 6.3 Editor feedback context
-
-For this location/component:
-
-```text
-last edit applied
-last edit scale
+last editor action
+last editor scale
 train gain
 heldout gain
 noise std
 z-score
-accepted/rejected/uncertain
-staleness/recency
-```
-
-### 6.4 Critic/memory context
-
-```text
-retrieved similar edits
-critic predicted gain
+accepted/rejected/uncertain/stale
+critic mean gain
 critic uncertainty
 critic risk
-memory accepted/rejected ratio
-retest status
-```
-
-### 6.5 Task/input/head context
-
-```text
-task embedding
-input/evidence summary
-head query summary
-class confusion vector
-train/val loss state
+retrieved memory accepted/rejected ratio
+who reads this slot later
+class/head pressure
+next-step read/write/primitive histograms
 training progress / epoch fraction
 ```
 
+This is the real “reverse answer” from editor back to the assembly shops.
+
 ---
 
-## 7. Typed object tokens and small heads
+## 5. Typed object heads, not one magic head
 
-Do not build huge raw-token attention. The mind attends over program objects.
+Use small matrix-program object heads, not raw-sequence attention.
 
-Suggested small heads:
+Suggested heads:
 
-### Location/role heads
+### Location and role
 
-1. phase-role head
-2. layer-order head
-3. block-specialization head
-4. slot-specialization head
+1. phase-role head;
+2. layer-order head;
+3. block-specialization head;
+4. slot-specialization head.
 
 ### Component heads
 
-5. primitive-usefulness head
-6. transition-chain head
-7. read-cell head
-8. write-cell head
-9. composition head
-10. operator-size/depth head
+5. primitive-usefulness head;
+6. operator-size/depth head;
+7. transition-chain head;
+8. read-cell head;
+9. write-cell head;
+10. composition head.
 
 ### Macro heads
 
-11. macro-selection head
-12. macro-conflict/collapse head
-13. macro-variation head
-14. macro-memory-retrieval head
+11. macro-selection head;
+12. macro-conflict/collapse head;
+13. macro-variation head;
+14. macro-memory-retrieval head.
 
 ### Task/head heads
 
-15. class-slot head
-16. class-confusion head
-17. downstream-consumer head
-18. head-pressure head
+15. class-slot head;
+16. class-confusion head;
+17. downstream-consumer head;
+18. head-pressure head.
 
-### Stability heads
+### Stability/safety heads
 
-19. entropy/collapse head
-20. complexity-budget head
-21. memory/global-usage head
-22. soft-vs-discrete-gap head
-23. heldout-risk head
-24. non-stationarity/recency head
+19. entropy/collapse head;
+20. complexity-budget head;
+21. memory/global-usage head;
+22. soft-vs-discrete-gap head;
+23. heldout-risk head;
+24. non-stationarity/recency head.
 
-MVP: 16-32 small heads. Later: 64-128 micro-heads. Not one 500-head LLM-like module.
-
----
-
-## 8. Critic architecture
-
-Use a small ensemble MLP.
-
-### Input
-
-```text
-x = concat(
-  context_embedding,      # fixed-size program/task/location summary
-  edit_embedding,         # proposed action summary
-  metric_embedding,       # loss/acc/entropy/collapse/skill
-  recency_embedding,      # epoch/progress/source age
-  complexity_embedding    # edit cost and scope
-)
-```
-
-### Output
-
-```text
-mean_gain       # predicted heldout gain
-log_variance    # uncertainty/noise
-risk_score      # probability of hurting heldout
-```
-
-### Uncertainty
-
-Use ensemble variance first:
-
-```text
-critic_ensemble = 3-5 MLPs
-uncertainty = variance(predicted_gain)
-```
-
-MC-dropout can be added later.
+MVP: 16-32 micro-heads. Later: 64-128.  
+Do not build a huge LLM-like head over raw audio tokens.
 
 ---
 
-## 9. Actor / policy
+## 6. Critic
 
-The actor proposes edit candidates or direct soft biases.
-
-MVP actor should be simple:
+The critic predicts the measured effect of an edit.
 
 ```text
-candidate generator + critic UCB + trust-region application
+critic(context_embedding, edit_embedding, metrics, recency, complexity)
+    -> mean_heldout_gain
+    -> uncertainty
+    -> risk_score
 ```
 
-Later neural actor:
+### 6.1 Cold-start critic
+
+Do not start with a large MLP ensemble when memory has only hundreds of records.
+
+Cold-start options:
+
+1. ridge / Bayesian linear regression on fixed embeddings;
+2. small calibrated linear model with posterior variance;
+3. only later: MLP ensemble when records > 3k-5k.
+
+Reason: early high-dimensional MLP critic can memorize noise and be badly calibrated out of distribution.
+
+### 6.2 Later critic
+
+When enough records exist:
 
 ```text
-typed object tokens + memory retrieval tokens -> bounded central bias tensors
+critic_ensemble = 3-5 small MLPs
+uncertainty = variance across ensemble
 ```
 
-The actor should be trained by:
-
-1. heldout architecture gradient;
-2. imitation of accepted edits;
-3. avoidance of rejected edits;
-4. critic distillation:
-
-```text
-maximize critic_predicted_gain - risk - complexity
-```
+The critic must be trained on tested edits only.
 
 ---
 
-## 10. Candidate generation
+## 7. Probe policy vs deploy policy
 
-Do not test everything.
+This must be explicit.
+
+### 7.1 Probe / exploration uses UCB
+
+For deciding what to test:
+
+```text
+score_probe(edit) = mean_gain + beta * uncertainty - risk_penalty - complexity_penalty
+```
+
+Uncertainty is good here because it means “worth exploring”.
+
+### 7.2 Live deployment uses LCB
+
+For deciding what to actually apply during the real run:
+
+```text
+score_deploy(edit) = mean_gain - beta * uncertainty - risk_penalty - complexity_penalty
+```
+
+Uncertainty is bad here because live deployment must be conservative.
+
+Never use UCB directly for online actor bias.
+
+---
+
+## 8. Candidate generation
 
 Candidate sources:
 
-1. gradient candidates;
+1. gradient pressure candidates;
 2. suppressed revival candidates;
 3. macro alternatives;
 4. memory-retrieved edits;
 5. anti-collapse edits;
 6. soft/discrete-gap edits;
 7. operator-size/depth edits;
-8. step/layer alive edits.
+8. step/layer alive edits;
+9. growth/promotion candidates.
 
 Candidate format:
 
 ```json
 {
-  "edit_type": "increase_primitive | shift_read | replace_macro | increase_transition | suppress_component | activate_step | change_operator_size",
+  "edit_type": "increase_primitive | shift_read | replace_macro | increase_transition | suppress_component | activate_step | change_operator_size | promote_macro",
   "where": "L1.S1.B2.K0",
   "target": "product_gate / memory.M2 / macro_7 / low_rank_r16",
   "delta_logit": 0.25,
@@ -472,22 +342,10 @@ Candidate format:
 }
 ```
 
----
-
-## 11. Acquisition policy
-
-Do not pick top-k only by gradient magnitude.
-
-Use UCB / Expected Improvement:
+Before critic exists, bootstrap candidate score:
 
 ```text
-score(edit) = predicted_gain + beta * uncertainty - lambda_risk * risk - lambda_complexity * cost
-```
-
-Early bootstrap before critic:
-
-```text
-score =
+score_bootstrap =
   0.30 * gradient_score
 + 0.25 * suppressed_revival_score
 + 0.25 * memory_similarity_score
@@ -495,11 +353,18 @@ score =
 + 0.05 * random_exploration
 ```
 
-Then replace with critic UCB after enough tested records.
+Switch to critic gradually:
+
+```text
+critic_weight = min(n_tested_records / N0, 1.0)
+score = (1 - critic_weight) * score_bootstrap + critic_weight * score_probe
+```
+
+No hard cutover.
 
 ---
 
-## 12. Two-tier testing
+## 9. Two-tier testing
 
 ### Tier 1: cheap screen
 
@@ -514,22 +379,22 @@ revert
 
 ### Tier 2: expensive verify
 
-Only for candidates that pass screen:
+For candidates that pass screen:
 
 ```text
 apply edit
-train N small steps or run short adaptation
-measure heldout
+train/adapt N small steps or run short heldout window
+measure heldout gain
 revert or keep
 ```
 
-Memory `accepted=true` requires Tier 2 or repeated Tier 1 with high significance.
+Memory `accepted=true` requires Tier 2 or repeated Tier 1 with strong significance.
 
 ---
 
-## 13. Noise floor and significance gate
+## 10. Noise floor and significance
 
-Before accepting edits, estimate noise:
+Estimate baseline noise:
 
 ```text
 baseline_losses = unchanged model on several heldout micro-batches
@@ -540,13 +405,15 @@ Acceptance:
 
 ```text
 accepted if gain > max(min_gain, k * noise_std)
+rejected if gain < -max(min_gain, k * noise_std)
+otherwise uncertain
 ```
 
 Recommended:
 
 ```text
 k = 2.0
-min_gain = small but nonzero
+min_gain = small nonzero threshold
 ```
 
 Store:
@@ -555,62 +422,159 @@ Store:
 noise_std
 z_score
 num_batches
+gain_metric
 ```
 
 ---
 
-## 14. Non-stationarity
+## 11. Sparse actor, not dense second optimizer
 
-Memory records must include:
+Memory validates mostly sparse one-factor or two-factor edits.  
+Therefore the actor must not output unrestricted dense tensors everywhere.
+
+Required constraints:
+
+1. L1 sparsity on actor bias;
+2. top-k mask per action family;
+3. max edit count per epoch/window;
+4. distillation to sparse accepted edits;
+5. penalty for many small nonzero changes.
+
+Online actor bias should look like:
 
 ```text
+few strong tested edits
+not tiny noise everywhere
+```
+
+Otherwise it becomes another dense optimizer and repeats the mirror-SGD problem.
+
+---
+
+## 12. Hard rollback + soft trust region
+
+Soft trust region:
+
+```text
+scale starts at 0.03
+if heldout improves: scale *= 1.05
+if heldout worsens: scale *= 0.5
+max scale: 0.20
+```
+
+Hard rollback is also required:
+
+```text
+save checkpoint before actor intervention
+if heldout window worsens by > k * noise_std:
+    restore checkpoint
+    disable actor bias for cooldown window
+    store edit as rejected/harmful
+```
+
+Trust-region scale only protects future steps. Rollback repairs damage already done.
+
+---
+
+## 13. Closed-loop critic re-verify
+
+Actor can exploit critic errors. This is standard model-based RL failure.
+
+Protection:
+
+```text
+every N steps/epochs:
+    take top edits actor actually deployed
+    run Tier-2 verify
+    compare critic predicted_gain vs real_gain
+    store prediction error
+    retrain critic with priority on actor-visited regions
+```
+
+The critic must be most accurate where the actor wants to act.
+
+---
+
+## 14. Memory bank
+
+Memory stores only tested records.
+
+Record fields:
+
+```text
+context_embedding
+edit_embedding
+edit type / location / target
+train_gain
+heldout_gain
+noise_std
+z_score
+accepted/rejected/uncertain
+critic_prediction_at_time
+prediction_error_after_reverify
+complexity_delta
 epoch
 training_progress
+run_id
 model_version
 program_version
-loss/acc range
-run_id
 source_task
+staleness / recency weight
 ```
+
+### 14.1 Non-stationarity
+
+Old records can become stale.
 
 Retrieval weight:
 
 ```text
-weight = similarity * recency_weight * reproducibility_weight
+memory_weight = similarity * recency_weight * reproducibility_weight
 ```
 
-Retest old accepted edits periodically. If they no longer work, decay confidence or mark stale.
+Retest old accepted edits periodically. If they stop working, decay confidence or mark stale.
 
----
+### 14.2 Compound edits
 
-## 15. Compound edit credit assignment
+Early memory should use one-factor edits whenever possible.
 
-Avoid large compound edits early.
-
-Rules:
-
-1. First memory should mostly use one-factor edits.
-2. Compound edits store sub-edit list.
-3. Later use small factorial tests:
-   - A only;
-   - B only;
-   - A+B.
-
-This prevents the critic from learning false correlations.
-
----
-
-## 16. Cross-task fixed-size embeddings
-
-For transfer across SMC, matrix-water-blockless, TTS/vocoder, etc., use a fixed-size encoder.
-
-Do not rely on raw histograms with task-specific shapes.
-
-Use typed-token pooling:
+For compound edits:
 
 ```text
-object tokens -> DeepSets / factorized attention -> fixed context vector
-edit tokens -> DeepSets / MLP pooling -> fixed edit vector
+store sub-edits
+run A only / B only / A+B factorial tests when possible
+```
+
+This prevents false credit assignment.
+
+---
+
+## 15. Cross-task fixed-size embeddings
+
+For transfer across SMC, matrix-water-blockless, TTS/vocoder, etc., use fixed-size typed-token encoders.
+
+Do not rely on raw shape-specific histograms only.
+
+```text
+ProgramContextEncoder:
+  typed object tokens -> DeepSets / factorized attention -> context_embedding
+
+EditEncoder:
+  edit tokens -> DeepSets / MLP pooling -> edit_embedding
+```
+
+Token fields:
+
+```text
+object type
+role / primitive category
+normalized location
+soft weight
+entropy / usage
+grad/counterfactual pressure
+accepted/rejected history
+operator family
+cell type: state/memory/global
 ```
 
 Output sizes:
@@ -622,63 +586,103 @@ edit_embedding: 64 or 128
 
 ---
 
-## 17. Trust-region control
+## 16. Open-ended growth / promotion loop
 
-Actor bias must be bounded adaptively.
+Without growth, actor only tunes a fixed search space. That is useful, but not open-ended architecture synthesis.
+
+Add Stage 8: tested-and-promoted macro/operator growth.
+
+### 16.1 Macro promotion criteria
+
+Promote a tested pattern into `MacroStepBank` if:
 
 ```text
-scale starts at 0.03
-if heldout improves: scale *= 1.05
-if heldout worsens: scale *= 0.5 and revert recent actor bias
-max scale: 0.20
+heldout gain passes noise gate
+reused across >= N examples/runs/tasks
+embedding distance from existing macros > duplicate threshold
+complexity budget acceptable
+not stale after retest
 ```
 
-This allows strong influence only after proven safe.
+Promoted macro becomes first-class:
+
+```text
+new macro id
+new macro read/primitive/transition/composition/write prototype
+available to actor like any other macro
+```
+
+### 16.2 Operator variant promotion
+
+If repeated edits discover a useful operator variant:
+
+```text
+low_rank_r16 + product_gate + phase path
+specific wavelet/diff/smooth mix
+block_butterfly depth2 pattern
+```
+
+then promote it as a named operator variant inside OperatorBankV2.
+
+Do not allow arbitrary Python generation first. Promote only combinations of existing safe matrix operators.
+
+### 16.3 Growth memory
+
+Every promoted element stores:
+
+```text
+source edits
+support count
+mean heldout gain
+variance/risk
+complexity cost
+examples where useful
+examples where harmful
+```
 
 ---
 
-## 18. How it connects to current code
+## 17. Soft-vs-discrete diagnostics
 
-### Add traces from `assembler_core.py`
-
-Expose:
-
-- flow logits or soft flows;
-- macro selector weights;
-- operator-v2 family weights;
-- step alive;
-- phase weights;
-- entropy summaries.
-
-### Add feedback injection
-
-Extend step forward:
-
-```python
-AssemblerStep.forward(cells, feedback_bias=None)
-```
-
-Bias contains:
+Periodically evaluate:
 
 ```text
-read_bias
-primitive_bias
-slot_transition_bias
-primitive_transition_bias
-composition_bias
-write_bias
-macro_bias
-phase_bias
-step_alive_bias
+soft program val loss
+argmax program val loss
+top-k sparse program val loss
+discretization_gap = discrete_val_loss - soft_val_loss
 ```
 
-### Add training hooks in `transfer_audio_assembler.py`
+If gap is large:
 
-- collect traces every N epochs;
-- run counterfactual screen;
-- update memory bank;
-- train critic;
-- optionally apply actor bias with trust region.
+- anneal temperature;
+- add path dropout;
+- strengthen entropy band;
+- prefer tested sparse edits;
+- do not trust dense soft actor too much.
+
+---
+
+## 18. Compute budget
+
+The central mind has a cost. Track it.
+
+Suggested limits:
+
+```text
+screen/probe budget <= 10-20% of training time
+critic training budget <= small scheduled window
+Tier-2 verify only for top candidates
+```
+
+Measure net benefit:
+
+```text
+accuracy gain / extra wall-clock cost
+heldout gain / probe budget
+```
+
+A smarter controller that doubles runtime for +0.2% is not useful on one P40.
 
 ---
 
@@ -690,7 +694,8 @@ step_alive_bias
 - log operator-v2 family choices;
 - log step alive;
 - log class-slot reads;
-- log memory/global usage.
+- log memory/global usage;
+- log editor actions/results.
 
 ### Stage 2: anti-collapse + bi-level
 
@@ -699,47 +704,85 @@ step_alive_bias
 - step/memory budget;
 - architecture parameters trained on heldout path.
 
-### Stage 3: counterfactual screen
+### Stage 3: feedback bus MVP
 
-- generate candidates;
-- forward-only screen;
+- create `ProgramFeedbackEncoder`;
+- project feedback into primitive/read/write/transition/macro/step logits;
+- initially feed only tested editor results and simple memory summaries.
+
+### Stage 4: counterfactual screen
+
+- generate sparse candidates;
+- forward-only heldout screen;
 - noise floor;
-- save tested records.
+- store tested records.
 
-### Stage 4: memory bank
+### Stage 5: memory bank
 
 - JSONL memory;
 - fixed-size embeddings;
 - accepted/rejected/uncertain/stale.
 
-### Stage 5: critic
+### Stage 6: cold-start critic
 
-- MLP ensemble;
-- predict gain/uncertainty/risk;
-- UCB acquisition.
+- Bayesian/ridge linear critic first;
+- upgrade to MLP ensemble after enough tested records.
 
-### Stage 6: rule/critic actor
+### Stage 7: rule/critic sparse actor
 
-- choose best bounded edit from candidates;
-- apply via trust region;
-- verify and store result.
+- choose edit by LCB for deploy;
+- UCB only for probe;
+- apply sparse bounded bias;
+- hard rollback + cooldown.
 
-### Stage 7: neural actor
+### Stage 8: growth/promotion
 
-- typed-token actor;
-- outputs central edit bias;
-- trained by heldout gradient + critic distillation + accepted/rejected imitation.
+- promote repeated useful macro variations;
+- promote safe operator variants;
+- update MacroStepBank / OperatorBankV2.
+
+### Stage 9: neural typed-token actor
+
+- typed object heads;
+- critic distillation;
+- accepted/rejected imitation;
+- heldout path training;
+- sparse top-k output and trust-region deployment.
 
 ---
 
-## 20. Short summary
+## 20. Minimal first code target
 
-The editor is the actuator.  
-The critic is the first real intelligence.  
-The memory is experience data.  
-The actor is the policy.  
-The counterfactual probe creates labels.  
-The trust region keeps it safe.  
-The assembler components must receive feedback from editor results, not only current data.
+Do not build the neural actor first.
 
-This is the correct path from differentiable matrix-program assembly to an active self-improving architecture builder.
+First useful MVP:
+
+```text
+ProgramFeedbackEncoder + CounterfactualScreen + MemoryBank + cold-start Critic
+```
+
+Then:
+
+```text
+one sparse LCB-selected edit per epoch/window
+apply with scale 0.03
+verify heldout
+rollback if harmful
+store record
+```
+
+This is the smallest real active mind.
+
+---
+
+## 21. Short summary
+
+The editor changes the program.  
+The feedback bus teaches the assembly workshops what editor actions worked.  
+The critic predicts which future edits will help.  
+UCB explores; LCB deploys safely.  
+The actor must be sparse.  
+Hard rollback is mandatory.  
+Memory must store only tested edits.  
+Growth/promotion turns repeated useful repairs into new first-class macros/operators.  
+That is the path from differentiable tuning to real matrix-program architecture synthesis.
