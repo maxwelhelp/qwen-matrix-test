@@ -285,6 +285,13 @@ class AudioAssemblerModel(nn.Module):
             channel_stages=args.channel_stages,
             dropout=args.dropout,
             use_deltas=True,
+            operator_v2=bool(getattr(args, "operator_v2", False)),
+            step_alive_init=float(getattr(args, "step_alive_init", 1.65)),
+            phase_prior_strength=float(getattr(args, "phase_prior_strength", 0.0)),
+            latent_roles=bool(getattr(args, "latent_roles", False)),
+            role_count=int(getattr(args, "role_count", 6)),
+            role_temperature=float(getattr(args, "role_temperature", 1.25)),
+            role_init_std=float(getattr(args, "role_init_std", 0.02)),
         )
         self.assembler_core = MatrixProgramAssemblerCore(cfg)
         self.head = AudioAssemblerHead(
@@ -556,6 +563,118 @@ def slot_diversity_loss(slots: torch.Tensor) -> torch.Tensor:
     return F.relu(offdiag - 0.55).mean()
 
 
+def _load_balance_loss(p: torch.Tensor, active_floor: float = 0.0) -> torch.Tensor:
+    # p [...,C], normalized distribution. Penalize extreme collapse while keeping it soft.
+    q = p.float().mean(dim=tuple(range(max(0, p.ndim - 1))))
+    q = q / q.sum().clamp_min(1e-8)
+    C = q.numel()
+    if C <= 1:
+        return torch.zeros((), device=p.device)
+    uniform = torch.full_like(q, 1.0 / float(C))
+    mse = (q - uniform).pow(2).mean()
+    ent = -(q.clamp_min(1e-8) * q.clamp_min(1e-8).log()).sum() / math.log(float(C))
+    floor = F.relu(torch.tensor(float(active_floor), device=p.device) - ent).pow(2)
+    return mse + floor
+
+
+def primitive_load_balance_loss(aux, floor: float) -> torch.Tensor:
+    return _load_balance_loss(aux.primitive_slot_flow, active_floor=floor)
+
+
+def read_write_cell_balance_loss(aux, floor: float) -> torch.Tensor:
+    rw = torch.cat([
+        aux.read_flow.float().mean(dim=-2).reshape(-1, aux.read_flow.shape[-1]),
+        aux.write_flow.float().reshape(-1, aux.write_flow.shape[-1]),
+    ], dim=0)
+    return _load_balance_loss(rw, active_floor=floor)
+
+
+def entropy_band_loss(aux, low: float, high: float) -> torch.Tensor:
+    vals = []
+    for key in ("read", "primitive", "slot_transition", "primitive_transition", "write"):
+        if key in aux.entropies:
+            vals.append(aux.entropies[key].float())
+    if not vals:
+        return torch.zeros((), device=aux.cells.device)
+    ent = torch.stack(vals).mean()
+    return F.relu(torch.tensor(float(low), device=ent.device) - ent).pow(2) + F.relu(ent - float(high)).pow(2)
+
+
+def step_alive_budget_loss(aux, target: float) -> torch.Tensor:
+    if "step_alive" not in aux.entropies:
+        return torch.zeros((), device=aux.cells.device)
+    return (aux.entropies["step_alive"].float() - float(target)).pow(2)
+
+
+def layer_program_similarity_loss(slots: torch.Tensor, layers: int, steps: int, blocks: int, margin: float) -> torch.Tensor:
+    # slots [N,T*B,D]. Build layer summaries [N,L,D] and penalize too-similar layers.
+    s = slots.float()
+    N, SB, D = s.shape
+    L, S, B = int(layers), int(steps), int(blocks)
+    need = L * S * B
+    if L <= 1 or SB < need:
+        return torch.zeros((), device=slots.device)
+    x = s[:, :need].view(N, L, S, B, D).mean(dim=(2, 3))
+    x = F.normalize(x, dim=-1)
+    sim = torch.einsum("nld,nmd->nlm", x, x)
+    eye = torch.eye(L, device=slots.device, dtype=sim.dtype).view(1, L, L)
+    off = sim - eye
+    return F.relu(off - float(margin)).mean()
+
+
+def step_program_similarity_loss(slots: torch.Tensor, layers: int, steps: int, blocks: int, margin: float) -> torch.Tensor:
+    # Penalize adjacent/near step summaries becoming clones.
+    s = slots.float()
+    N, SB, D = s.shape
+    L, S, B = int(layers), int(steps), int(blocks)
+    T = L * S
+    need = T * B
+    if T <= 1 or SB < need:
+        return torch.zeros((), device=slots.device)
+    x = s[:, :need].view(N, T, B, D).mean(dim=2)
+    x = F.normalize(x, dim=-1)
+    sim = torch.einsum("ntd,nud->ntu", x, x)
+    eye = torch.eye(T, device=slots.device, dtype=sim.dtype).view(1, T, T)
+    off = sim - eye
+    # Adjacent steps are allowed to be somewhat related, but not identical.
+    return F.relu(off - float(margin)).mean()
+
+
+def role_usage_balance_loss(aux, floor: float) -> torch.Tensor:
+    if getattr(aux, "role_usage", None) is None:
+        return torch.zeros((), device=aux.cells.device)
+    usage = aux.role_usage.float()
+    usage = usage / usage.sum().clamp_min(1e-8)
+    R = usage.numel()
+    if R <= 1:
+        return torch.zeros((), device=aux.cells.device)
+    entropy = -(usage.clamp_min(1e-8) * usage.clamp_min(1e-8).log()).sum() / math.log(float(R))
+    uniform = torch.full_like(usage, 1.0 / float(R))
+    return (usage - uniform).pow(2).mean() + F.relu(torch.tensor(float(floor), device=usage.device) - entropy).pow(2)
+
+
+def role_entropy_band_loss(aux, low: float, high: float) -> torch.Tensor:
+    if getattr(aux, "role_entropy", None) is None:
+        return torch.zeros((), device=aux.cells.device)
+    ent = aux.role_entropy.float().mean()
+    R = max(2, int(aux.role_usage.numel())) if getattr(aux, "role_usage", None) is not None else 2
+    ent_norm = ent / math.log(float(R))
+    return F.relu(torch.tensor(float(low), device=ent.device) - ent_norm).pow(2) + F.relu(ent_norm - float(high)).pow(2)
+
+
+def role_similarity_loss(aux, margin: float) -> torch.Tensor:
+    if getattr(aux, "role_mix", None) is None:
+        return torch.zeros((), device=aux.cells.device)
+    mix = aux.role_mix.float().reshape(-1, aux.role_mix.shape[-1])
+    if mix.shape[0] <= 1:
+        return torch.zeros((), device=aux.cells.device)
+    mix = F.normalize(mix, dim=-1)
+    sim = torch.matmul(mix, mix.t())
+    eye = torch.eye(sim.shape[0], device=sim.device, dtype=sim.dtype)
+    off = sim - eye
+    return F.relu(off - float(margin)).mean()
+
+
 def aux_losses(logits: torch.Tensor, aux, haux, args, flow_targets, skill_weights) -> Dict[str, torch.Tensor]:
     if flow_targets:
         skill, flow_losses = assembler_skill_loss(aux, flow_targets, skill_weights)
@@ -573,6 +692,17 @@ def aux_losses(logits: torch.Tensor, aux, haux, args, flow_targets, skill_weight
     out["class_attn_entropy"] = class_attention_entropy(haux["class_slot_attention"])
     out["phase_balance"] = phase_balance_loss(haux["class_phase_mass"], args.min_early_phase_mass, args.max_aggregate_phase_mass)
     out["slot_div"] = slot_diversity_loss(aux.slots)
+    out["layer_sim"] = layer_program_similarity_loss(aux.slots, args.layers, args.steps, args.blocks, args.layer_sim_margin)
+    out["step_sim"] = step_program_similarity_loss(aux.slots, args.layers, args.steps, args.blocks, args.step_sim_margin)
+    out["primitive_balance"] = primitive_load_balance_loss(aux, args.primitive_balance_entropy_floor)
+    out["cell_balance"] = read_write_cell_balance_loss(aux, args.cell_balance_entropy_floor)
+    out["entropy_band"] = entropy_band_loss(aux, args.entropy_band_low, args.entropy_band_high)
+    out["step_alive_budget"] = step_alive_budget_loss(aux, args.step_alive_target)
+    out["role_usage_balance"] = role_usage_balance_loss(aux, args.role_usage_entropy_floor)
+    out["role_entropy_band"] = role_entropy_band_loss(aux, args.role_entropy_low, args.role_entropy_high)
+    out["role_similarity"] = role_similarity_loss(aux, args.role_similarity_margin)
+    out["role_usage_max"] = aux.role_usage.float().max() if getattr(aux, "role_usage", None) is not None else torch.zeros((), device=logits.device)
+    out["role_entropy"] = aux.role_entropy.float().mean() if getattr(aux, "role_entropy", None) is not None else torch.zeros((), device=logits.device)
     out["logit_norm"] = logits.float().pow(2).mean()
     out["pair_update_norm"] = haux["pair_update_norm"].float()
     out["class_write"] = haux["class_write"].float()
@@ -603,6 +733,15 @@ def train_epoch(model, loader, opt, scaler, device, dtype, args, epoch: int, flo
             loss = loss + args.lambda_class_attn_entropy * losses["class_attn_entropy"]
             loss = loss + args.lambda_phase_balance * losses["phase_balance"]
             loss = loss + args.lambda_slot_div * losses["slot_div"]
+            loss = loss + args.lambda_layer_sim * losses["layer_sim"]
+            loss = loss + args.lambda_step_sim * losses["step_sim"]
+            loss = loss + args.lambda_primitive_balance * losses["primitive_balance"]
+            loss = loss + args.lambda_cell_balance * losses["cell_balance"]
+            loss = loss + args.lambda_entropy_band * losses["entropy_band"]
+            loss = loss + args.lambda_step_alive_budget * losses["step_alive_budget"]
+            loss = loss + args.lambda_role_usage_balance * losses["role_usage_balance"]
+            loss = loss + args.lambda_role_entropy_band * losses["role_entropy_band"]
+            loss = loss + args.lambda_role_similarity * losses["role_similarity"]
             loss = loss + args.lambda_logit_norm * losses["logit_norm"]
         if not torch.isfinite(loss):
             print("NONFINITE_LOSS skip", flush=True)
@@ -658,6 +797,10 @@ def evaluate(model, loader, device, dtype, args, flow_targets, skill_weights):
             "memory_usage": float(aux.memory_usage.detach().cpu()),
             "global_usage": float(aux.global_usage.detach().cpu()),
             "entropy": {k: float(v.detach().cpu()) for k, v in aux.entropies.items()},
+            "role_usage": aux.role_usage.detach().cpu().tolist() if getattr(aux, "role_usage", None) is not None else None,
+            "role_mix": aux.role_mix.detach().cpu().tolist() if getattr(aux, "role_mix", None) is not None else None,
+            "role_entropy_mean": float(aux.role_entropy.float().mean().detach().cpu()) if getattr(aux, "role_entropy", None) is not None else 0.0,
+            "role_similarity": float(aux.role_similarity.detach().cpu()) if getattr(aux, "role_similarity", None) is not None else 0.0,
             "phase_mass_mean": {
                 PHASES[i]: float(haux["class_phase_mass"].float().mean(dim=(0, 1))[i].detach().cpu())
                 for i in range(len(PHASES))
@@ -726,7 +869,10 @@ def run(args) -> None:
     fields = [
         "epoch", "train_loss", "train_ce", "train_acc", "val_loss", "val_acc", "best_acc",
         "skill", "read_flow_kl", "primitive_slot_kl", "slot_transition_kl", "primitive_transition_kl", "slot_composition_kl", "write_flow_kl",
-        "write_budget", "update_alive", "class_read_div", "class_slot_prior", "class_attn_entropy", "phase_balance", "slot_div", "logit_norm",
+        "write_budget", "update_alive", "class_read_div", "class_slot_prior", "class_attn_entropy", "phase_balance", "slot_div", "layer_sim", "step_sim",
+        "primitive_balance", "cell_balance", "entropy_band", "step_alive_budget",
+        "role_usage_balance", "role_entropy_band", "role_similarity", "role_usage_max", "role_entropy",
+        "logit_norm",
         "pair_update_norm", "class_write",
     ]
     with (out_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
@@ -818,6 +964,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--memory-cells", type=int, default=4)
     p.add_argument("--global-cells", type=int, default=2)
     p.add_argument("--channel-stages", type=int, default=3)
+    p.add_argument("--operator-v2", action="store_true")
+    p.add_argument("--step-alive-init", type=float, default=1.65)
+    p.add_argument("--latent-roles", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--role-count", type=int, default=6)
+    p.add_argument("--role-temperature", type=float, default=1.25)
+    p.add_argument("--role-init-std", type=float, default=0.02)
     p.add_argument("--pair-slots", type=int, default=12)
     p.add_argument("--dropout", type=float, default=0.04)
     p.add_argument("--head-dropout", type=float, default=0.05)
@@ -843,6 +995,26 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-phase-balance", type=float, default=0.045)
     p.add_argument("--class-slot-prior-sigma", type=float, default=1.45)
     p.add_argument("--lambda-slot-div", type=float, default=0.002)
+    p.add_argument("--lambda-layer-sim", type=float, default=0.000)
+    p.add_argument("--lambda-step-sim", type=float, default=0.000)
+    p.add_argument("--layer-sim-margin", type=float, default=0.25)
+    p.add_argument("--step-sim-margin", type=float, default=0.45)
+    p.add_argument("--lambda-primitive-balance", type=float, default=0.000)
+    p.add_argument("--lambda-cell-balance", type=float, default=0.000)
+    p.add_argument("--lambda-entropy-band", type=float, default=0.000)
+    p.add_argument("--lambda-step-alive-budget", type=float, default=0.000)
+    p.add_argument("--lambda-role-usage-balance", type=float, default=0.000)
+    p.add_argument("--lambda-role-entropy-band", type=float, default=0.000)
+    p.add_argument("--lambda-role-similarity", type=float, default=0.000)
+    p.add_argument("--primitive-balance-entropy-floor", type=float, default=0.72)
+    p.add_argument("--cell-balance-entropy-floor", type=float, default=0.62)
+    p.add_argument("--entropy-band-low", type=float, default=1.05)
+    p.add_argument("--entropy-band-high", type=float, default=2.35)
+    p.add_argument("--step-alive-target", type=float, default=0.78)
+    p.add_argument("--role-usage-entropy-floor", type=float, default=0.72)
+    p.add_argument("--role-entropy-low", type=float, default=0.35)
+    p.add_argument("--role-entropy-high", type=float, default=0.92)
+    p.add_argument("--role-similarity-margin", type=float, default=0.78)
     p.add_argument("--lambda-logit-norm", type=float, default=0.0007)
     p.add_argument("--w-read", type=float, default=0.25)
     p.add_argument("--w-primitive", type=float, default=0.30)

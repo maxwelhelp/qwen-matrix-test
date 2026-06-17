@@ -57,6 +57,13 @@ class AssemblerConfig:
     channel_stages: int = 3
     dropout: float = 0.04
     use_deltas: bool = True
+    phase_prior_strength: float = 0.0
+    operator_v2: bool = False
+    step_alive_init: float = 1.65
+    latent_roles: bool = False
+    role_count: int = 6
+    role_temperature: float = 1.25
+    role_init_std: float = 0.02
 
     @property
     def address_cells(self) -> int:
@@ -80,6 +87,11 @@ class AssemblerAux:
     entropies: Dict[str, torch.Tensor]
     cell_names: List[str]
     slot_names: List[str]
+    role_mix: torch.Tensor | None = None
+    role_usage: torch.Tensor | None = None
+    role_entropy: torch.Tensor | None = None
+    role_similarity: torch.Tensor | None = None
+    step_alive: torch.Tensor | None = None
 
 
 def _entropy(p: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -305,8 +317,15 @@ class AssemblerStep(nn.Module):
         self.gate_c = nn.Parameter(torch.randn(self.D, self.D) * 0.02)
         self.gate_bias = nn.Parameter(torch.full((self.D,), -0.35))
         self.layer_step_key = nn.Parameter(torch.randn(self.D) * 0.02)
-        phase_logits = torch.full((len(PHASES),), -0.65)
-        phase_logits[min(layer, len(PHASES) - 1)] = 1.25
+        # Phase prior is optional. With phase_prior_strength=0, layers do not
+        # start as extract/compare/suppress/aggregate; they must specialize from
+        # data + losses. With strength>0, this becomes only a scaled soft init.
+        phase_strength = 0.0 if bool(getattr(cfg, "latent_roles", False)) else float(getattr(cfg, "phase_prior_strength", 0.0))
+        if phase_strength <= 0.0:
+            phase_logits = torch.zeros((len(PHASES),))
+        else:
+            phase_logits = torch.full((len(PHASES),), -0.65 * phase_strength)
+            phase_logits[min(layer, len(PHASES) - 1)] = 1.25 * phase_strength
         self.phase_mix_logits = nn.Parameter(phase_logits)
         self.phase_mix_delta = nn.Parameter(torch.zeros(len(PHASES)))
         self.matrix_attention = MatrixButterflyAttention(
@@ -351,6 +370,13 @@ class AssemblerStep(nn.Module):
             rank=max(8, self.D // 6),
             dropout=cfg.dropout,
         )
+        self.role_flow = nn.Linear(self.D, self.flow_context_size, bias=False)
+        self.role_step_alive = nn.Linear(self.D, 1, bias=False)
+        self.role_operator = nn.Linear(self.D, 20, bias=False)
+        role_std = float(getattr(cfg, "role_init_std", 0.02))
+        nn.init.normal_(self.role_flow.weight, mean=0.0, std=role_std)
+        nn.init.normal_(self.role_step_alive.weight, mean=0.0, std=role_std)
+        nn.init.normal_(self.role_operator.weight, mean=0.0, std=role_std)
 
         # LoRA-like task deltas. In delta mode only these are trainable.
         self.read_delta = nn.Parameter(torch.zeros(self.B, self.K, self.A))
@@ -362,6 +388,30 @@ class AssemblerStep(nn.Module):
 
         self.drop = nn.Dropout(cfg.dropout)
         self.norm = nn.LayerNorm(self.D)
+
+        # OperatorBankV2 keeps the external primitive count P unchanged for
+        # checkpoint/dataset compatibility, but each primitive becomes a soft
+        # family of fast matrix operators: low-rank sizes, butterfly depths,
+        # local Toeplitz-like smooth/diff, Haar wavelet-like channel transform,
+        # diagonal gates, and richer phase variants.
+        self.operator_v2_enabled = bool(getattr(cfg, "operator_v2", False))
+        self.step_alive_logit = nn.Parameter(torch.tensor(float(getattr(cfg, "step_alive_init", 1.65))))
+        self.step_alive_delta = nn.Parameter(torch.zeros(()))
+        self.opv2_channel_logits = nn.Parameter(torch.tensor([1.20, -0.15, -0.35]))
+        self.opv2_block_logits = nn.Parameter(torch.tensor([1.10, -0.10, -0.35]))
+        self.opv2_lowrank_logits = nn.Parameter(torch.tensor([0.20, 0.70, 0.35]))
+        self.opv2_ctx_logits = nn.Parameter(torch.tensor([1.00, -0.10, -0.25, -0.35]))
+        self.opv2_product_logits = nn.Parameter(torch.tensor([0.90, -0.05, -0.25]))
+        phase_extra_init = torch.zeros(4) if bool(getattr(cfg, "latent_roles", False)) else torch.tensor([-0.10, -0.20, -0.25, -0.35])
+        self.phase_extra_logits = nn.Parameter(phase_extra_init)
+        self.opv2_channel_delta = nn.Parameter(torch.zeros(3))
+        self.opv2_block_delta = nn.Parameter(torch.zeros(3))
+        self.opv2_lowrank_delta = nn.Parameter(torch.zeros(3))
+        self.opv2_ctx_delta = nn.Parameter(torch.zeros(4))
+        self.opv2_product_delta = nn.Parameter(torch.zeros(3))
+        self.phase_extra_delta = nn.Parameter(torch.zeros(4))
+        self.diag_gate = nn.Parameter(torch.zeros(self.D))
+        self.diag_bias = nn.Parameter(torch.zeros(self.D))
 
     def _state_idx(self, b: int) -> int:
         return b
@@ -403,6 +453,11 @@ class AssemblerStep(nn.Module):
 
     def _primitive_slot_prior(self) -> torch.Tensor:
         x = torch.zeros(self.B, self.K, self.P)
+        phase_strength = 0.0 if bool(getattr(self.cfg, "latent_roles", False)) else float(getattr(self.cfg, "phase_prior_strength", 0.0))
+        if phase_strength <= 0.0:
+            # No role prior: all primitive families start equal. Tiny noise only
+            # breaks exact symmetry; layer specialization must emerge from data.
+            return x + 0.01 * torch.randn_like(x)
         idx = {name: i for i, name in enumerate(PRIMITIVES)}
         phase_sets = {
             "extract": ["ctx_matrix", "channel_butterfly", "phase_matrix"],
@@ -415,8 +470,7 @@ class AssemblerStep(nn.Module):
             for k in range(self.K):
                 for j, name in enumerate(names):
                     if name in idx:
-                        x[b, k, idx[name]] += 0.65 / (1 + abs(k - j))
-                # Keep every primitive alive, but softly phase-biased.
+                        x[b, k, idx[name]] += phase_strength * 0.65 / (1 + abs(k - j))
                 x[b, k, :] += 0.03
         return x + 0.01 * torch.randn_like(x)
 
@@ -429,11 +483,15 @@ class AssemblerStep(nn.Module):
         return x + 0.01 * torch.randn_like(x)
 
     def _primitive_transition_prior(self) -> torch.Tensor:
-        x = torch.eye(self.P) * 0.35
+        phase_strength = 0.0 if bool(getattr(self.cfg, "latent_roles", False)) else float(getattr(self.cfg, "phase_prior_strength", 0.0))
+        if phase_strength <= 0.0:
+            # No role prior: transitions start near uniform logits with tiny noise.
+            return torch.zeros(self.P, self.P) + 0.01 * torch.randn(self.P, self.P)
+        x = torch.eye(self.P) * (0.35 * phase_strength)
         idx = {name: i for i, name in enumerate(PRIMITIVES)}
         def link(a: str, b: str, v: float) -> None:
             if a in idx and b in idx:
-                x[idx[a], idx[b]] = v
+                x[idx[a], idx[b]] = v * phase_strength
         if self.phase == "extract":
             link("ctx_matrix", "channel_butterfly", 0.75)
             link("channel_butterfly", "phase_matrix", 0.60)
@@ -451,7 +509,7 @@ class AssemblerStep(nn.Module):
     def _eff(self, base: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
         return base + delta if self.cfg.use_deltas else base
 
-    def _context_flow_bias(self, cells: torch.Tensor):
+    def _context_flow_bias(self, cells: torch.Tensor, role_context: torch.Tensor | None = None):
         # cells: [N,A,D] -> per-example additive logits for all flow matrices.
         state_ctx = cells[:, : self.B].mean(dim=1)
         mem0 = self.B
@@ -469,6 +527,9 @@ class AssemblerStep(nn.Module):
         flat = self.ctx_flow(ctx)
         if self.cfg.use_deltas:
             flat = flat + self.ctx_flow_delta(ctx)
+        if bool(getattr(self.cfg, "latent_roles", False)) and role_context is not None:
+            role = role_context.to(device=cells.device, dtype=torch.float32).view(1, -1)
+            flat = flat + self.role_flow(role).expand_as(flat)
         flat = flat.to(device=cells.device, dtype=cells.dtype)
         sizes = [
             self.B * self.K * self.A,
@@ -488,39 +549,133 @@ class AssemblerStep(nn.Module):
             wr.view(cells.shape[0], self.B, self.A),
         )
 
-    def _primitive_outputs(self, read_ctx: torch.Tensor) -> torch.Tensor:
+    def _opv2_weights(self, logits: torch.Tensor, delta: torch.Tensor | None = None, bias: torch.Tensor | None = None, dtype=None, device=None) -> torch.Tensor:
+        z = logits
+        if self.cfg.use_deltas and delta is not None:
+            z = z + delta
+        if bias is not None:
+            z = z + bias.to(device=z.device, dtype=z.dtype)
+        z = z.float()
+        w = torch.softmax(z, dim=-1)
+        if device is not None:
+            w = w.to(device=device)
+        if dtype is not None:
+            w = w.to(dtype=dtype)
+        return w
+
+    def _local_smooth_flat(self, x: torch.Tensor) -> torch.Tensor:
+        return 0.50 * x + 0.25 * torch.roll(x, 1, dims=-1) + 0.25 * torch.roll(x, -1, dims=-1)
+
+    def _local_diff_flat(self, x: torch.Tensor) -> torch.Tensor:
+        return x - self._local_smooth_flat(x)
+
+    def _haar_flat(self, x: torch.Tensor) -> torch.Tensor:
+        # Fast orthogonal-ish Haar step over channel pairs. Shape is preserved.
+        D = x.shape[-1]
+        if D < 2:
+            return x
+        even = x[..., 0::2]
+        odd = x[..., 1::2]
+        m = min(even.shape[-1], odd.shape[-1])
+        avg = (even[..., :m] + odd[..., :m]) * 0.70710678
+        dif = (even[..., :m] - odd[..., :m]) * 0.70710678
+        y = x.clone()
+        y[..., 0:2*m:2] = avg
+        y[..., 1:2*m:2] = dif
+        return y
+
+    def _mix_last(self, variants: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        # variants [...,V,D], weights [V]
+        return torch.einsum("v,...vd->...d", weights, variants)
+
+    def _operator_role_biases(self, role_context: torch.Tensor | None, device: torch.device, dtype: torch.dtype):
+        if not bool(getattr(self.cfg, "latent_roles", False)) or role_context is None:
+            return (None, None, None, None, None, None)
+        raw = self.role_operator(role_context.to(device=device, dtype=torch.float32).view(1, -1)).squeeze(0)
+        raw = raw.to(device=device, dtype=dtype)
+        return torch.split(raw, [3, 3, 3, 4, 3, 4], dim=0)
+
+    def _primitive_outputs(self, read_ctx: torch.Tensor, role_context: torch.Tensor | None = None) -> torch.Tensor:
         # read_ctx: [N,B,K,D] -> [N,B,K,P,D]
         N, B, K, D = read_ctx.shape
         flat = read_ctx.reshape(N * B * K, D)
-        ctx_m = flat @ self.ctx_w.to(device=read_ctx.device, dtype=read_ctx.dtype)
-        channel = self.channel((flat + ctx_m).view(N * B * K, 1, D)).view(N, B, K, D)
-        low = ((flat @ self.low_a.to(device=read_ctx.device, dtype=read_ctx.dtype)) @ self.low_b.to(device=read_ctx.device, dtype=read_ctx.dtype)).view(N, B, K, D)
-        ctx_m = ctx_m.view(N, B, K, D)
-        product = read_ctx * torch.tanh(ctx_m)
+        dev, dtype = read_ctx.device, read_ctx.dtype
+        ch_bias, bl_bias, low_bias, ctx_bias, pr_bias, phase_bias = self._operator_role_biases(role_context, dev, dtype)
 
-        # Block primitive mixes across blocks for every slot k.
+        ctx_lin_flat = flat @ self.ctx_w.to(device=dev, dtype=dtype)
+        smooth_flat = self._local_smooth_flat(flat)
+        diff_flat = self._local_diff_flat(flat)
+        haar_flat = self._haar_flat(flat)
+        diag_flat = flat * torch.sigmoid(self.diag_gate.to(device=dev, dtype=dtype).view(1, -1) + self.diag_bias.to(device=dev, dtype=dtype).view(1, -1))
+
+        # Low-rank size selection from slices of the max-rank factorization.
+        rank_total = int(self.low_a.shape[1])
+        r1 = max(4, rank_total // 4)
+        r2 = max(r1, rank_total // 2)
+        lows = []
+        for r in (r1, r2, rank_total):
+            la = self.low_a[:, :r].to(device=dev, dtype=dtype)
+            lb = self.low_b[:r, :].to(device=dev, dtype=dtype)
+            lows.append((flat @ la) @ lb)
+        low_w = self._opv2_weights(self.opv2_lowrank_logits, self.opv2_lowrank_delta, bias=low_bias, dtype=dtype, device=dev)
+        low = self._mix_last(torch.stack(lows, dim=1), low_w).view(N, B, K, D)
+
+        # Context primitive becomes a selectable family: dense ctx, local smooth,
+        # local diff, diagonal gate. All are linear/diagonal/Toeplitz-like fast ops.
+        ctx_w = self._opv2_weights(self.opv2_ctx_logits, self.opv2_ctx_delta, bias=ctx_bias, dtype=dtype, device=dev)
+        ctx_m = self._mix_last(torch.stack([ctx_lin_flat, smooth_flat, diff_flat, diag_flat], dim=1), ctx_w).view(N, B, K, D)
+
+        # Channel primitive variants: one butterfly pass, two passes, Haar wavelet-like pass.
+        ch1_flat = self.channel((flat + ctx_lin_flat).view(N * B * K, 1, D)).view(N * B * K, D)
+        ch2_flat = self.channel((ch1_flat + 0.35 * ctx_lin_flat).view(N * B * K, 1, D)).view(N * B * K, D)
+        ch_w = self._opv2_weights(self.opv2_channel_logits, self.opv2_channel_delta, bias=ch_bias, dtype=dtype, device=dev)
+        channel = self._mix_last(torch.stack([ch1_flat, ch2_flat, haar_flat], dim=1), ch_w).view(N, B, K, D)
+
+        # Block primitive variants: one block butterfly, two block butterfly passes,
+        # and global block mean injection.
         block_in = read_ctx.permute(0, 2, 1, 3).reshape(N * K, B, D)
-        block = self.block(block_in).reshape(N, K, B, D).permute(0, 2, 1, 3)
+        block1 = self.block(block_in).reshape(N, K, B, D).permute(0, 2, 1, 3)
+        block2_in = block1.permute(0, 2, 1, 3).reshape(N * K, B, D)
+        block2 = self.block(block2_in).reshape(N, K, B, D).permute(0, 2, 1, 3)
+        block_mean = read_ctx.mean(dim=1, keepdim=True).expand_as(read_ctx)
+        bl_w = self._opv2_weights(self.opv2_block_logits, self.opv2_block_delta, bias=bl_bias, dtype=dtype, device=dev)
+        block = self._mix_last(torch.stack([block1, block2, block_mean], dim=3), bl_w)
+
+        # Product/gate primitive variants.
+        product0 = read_ctx * torch.tanh(ctx_m)
+        product1 = read_ctx * torch.sigmoid(ctx_m)
+        product2 = diff_flat.view(N, B, K, D) * torch.sigmoid(ctx_m)
+        pr_w = self._opv2_weights(self.opv2_product_logits, self.opv2_product_delta, bias=pr_bias, dtype=dtype, device=dev)
+        product = self._mix_last(torch.stack([product0, product1, product2], dim=3), pr_w)
 
         gate = torch.sigmoid(
-            read_ctx @ self.gate_h.to(device=read_ctx.device, dtype=read_ctx.dtype)
-            + ctx_m @ self.gate_c.to(device=read_ctx.device, dtype=read_ctx.dtype)
-            + self.gate_bias.to(device=read_ctx.device, dtype=read_ctx.dtype)
+            read_ctx @ self.gate_h.to(device=dev, dtype=dtype)
+            + ctx_m @ self.gate_c.to(device=dev, dtype=dtype)
+            + self.gate_bias.to(device=dev, dtype=dtype)
         )
+        smooth = smooth_flat.view(N, B, K, D)
+        diff = diff_flat.view(N, B, K, D)
+        haar = haar_flat.view(N, B, K, D)
         phase_candidates = torch.stack([
             channel + 0.50 * ctx_m,
             channel - low,
             -gate * block.mean(dim=1, keepdim=True),
             block + read_ctx.mean(dim=1, keepdim=True),
+            smooth + 0.35 * ctx_m,
+            diff + 0.25 * product,
+            haar + 0.25 * channel,
+            low + product,
         ], dim=3)
-        phase_logits = self.phase_mix_logits
+        phase_logits = torch.cat([self.phase_mix_logits, self.phase_extra_logits], dim=0)
         if self.cfg.use_deltas:
-            phase_logits = phase_logits + self.phase_mix_delta
-        phase_w = torch.softmax(phase_logits.float(), dim=-1).to(read_ctx.dtype)
+            phase_logits = phase_logits + torch.cat([self.phase_mix_delta, self.phase_extra_delta], dim=0)
+        if phase_bias is not None:
+            phase_logits = phase_logits + torch.cat([torch.zeros_like(self.phase_mix_logits), phase_bias.to(device=dev, dtype=phase_logits.dtype)], dim=0)
+        phase_w = torch.softmax(phase_logits.float(), dim=-1).to(dtype)
         phase = torch.einsum("f,nbkfd->nbkd", phase_w, phase_candidates)
         return torch.stack([channel, block, low, ctx_m, product, phase], dim=3)
 
-    def forward(self, cells: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, cells: torch.Tensor, role_context: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         # cells: [N,A,D]
         cells = self.matrix_attention(cells, use_deltas=self.cfg.use_deltas)
         read_logits = self._eff(self.read_logits, self.read_delta)
@@ -530,7 +685,7 @@ class AssemblerStep(nn.Module):
         comp_logits = self._eff(self.slot_composition_logits, self.slot_composition_delta)
         write_logits = self._eff(self.write_logits, self.write_delta)
 
-        read_b, prim_b, slot_b, ptrans_b, comp_b, write_b = self._context_flow_bias(cells)
+        read_b, prim_b, slot_b, ptrans_b, comp_b, write_b = self._context_flow_bias(cells, role_context=role_context)
         read_e, prim_e, slot_e, ptrans_e, comp_e, write_e = self.flow_editor(cells, use_deltas=self.cfg.use_deltas)
         read_w = torch.softmax(read_logits.float().unsqueeze(0) + read_b.float() + read_e.float(), dim=-1).to(cells.dtype)        # [N,B,K,A]
         prim_w = torch.softmax(prim_logits.float().unsqueeze(0) + prim_b.float() + prim_e.float(), dim=-1).to(cells.dtype)        # [N,B,K,P]
@@ -540,7 +695,7 @@ class AssemblerStep(nn.Module):
         write_w = torch.softmax(write_logits.float().unsqueeze(0) + write_b.float() + write_e.float(), dim=-1).to(cells.dtype)      # [N,B,A]
 
         read_ctx = torch.einsum("nbka,nad->nbkd", read_w, cells)                   # [N,B,K,D]
-        prim_out = self._primitive_outputs(read_ctx)                               # [N,B,K,P,D]
+        prim_out = self._primitive_outputs(read_ctx, role_context=role_context)     # [N,B,K,P,D]
 
         # Factorized transitions: primitive type transition and slot transition.
         prim_mixed = torch.einsum("npq,nbkqd->nbkpd", prim_trans, prim_out)        # [N,B,K,P,D]
@@ -549,9 +704,17 @@ class AssemblerStep(nn.Module):
         slot_val = torch.einsum("nbkp,nbkpd->nbkd", prim_w, slot_mixed)             # [N,B,K,D]
         update = torch.einsum("nbk,nbkd->nbd", comp_w, slot_val)                   # [N,B,D]
         update = self.norm(self.drop(update))
+        step_alive_logit = self.step_alive_logit
+        if self.cfg.use_deltas:
+            step_alive_logit = step_alive_logit + self.step_alive_delta
+        if bool(getattr(self.cfg, "latent_roles", False)) and role_context is not None:
+            role_alive = self.role_step_alive(role_context.to(device=cells.device, dtype=torch.float32).view(1, -1)).squeeze()
+            step_alive_logit = step_alive_logit + role_alive.to(device=cells.device, dtype=step_alive_logit.dtype)
+        step_alive = torch.sigmoid(step_alive_logit.to(device=cells.device, dtype=cells.dtype))
+        active_update = step_alive * update
 
         write_gate = torch.sigmoid(self.write_gate_logit.to(device=cells.device, dtype=cells.dtype)).view(1, self.B, 1)
-        delta_cells = torch.einsum("nba,nbd->nad", write_w, write_gate * update)    # [N,A,D]
+        delta_cells = torch.einsum("nba,nbd->nad", write_w, write_gate * active_update)    # [N,A,D]
         next_cells = self.norm(cells + delta_cells)
 
         info = {
@@ -562,7 +725,8 @@ class AssemblerStep(nn.Module):
             "slot_composition_flow": comp_w.float(),
             "write_flow": write_w.float(),
             "write_gates": write_gate.detach().float().squeeze(0).squeeze(-1),
-            "update_norms": update.detach().float().norm(dim=-1),
+            "update_norms": active_update.detach().float().norm(dim=-1),
+            "step_alive": step_alive.detach().float(),
             "slot_values": slot_val.detach(),
             "entropy_read": _entropy(read_w, dim=-1).mean().detach(),
             "entropy_primitive": _entropy(prim_w, dim=-1).mean().detach(),
@@ -570,7 +734,7 @@ class AssemblerStep(nn.Module):
             "entropy_primitive_transition": _entropy(prim_trans, dim=-1).mean().detach(),
             "entropy_write": _entropy(write_w, dim=-1).mean().detach(),
         }
-        return next_cells, update, info
+        return next_cells, active_update, info
 
 
 class MatrixProgramAssemblerCore(nn.Module):
@@ -589,17 +753,48 @@ class MatrixProgramAssemblerCore(nn.Module):
         self.K = int(cfg.primitive_slots)
         self.P = len(PRIMITIVES)
         self.total_steps = int(cfg.layers * cfg.steps)
+        self.latent_roles_enabled = bool(getattr(cfg, "latent_roles", False))
+        self.role_count = max(1, int(getattr(cfg, "role_count", 6)))
 
         self.cell_query = nn.Parameter(torch.randn(self.A, self.D) * 0.04)
         self.cell_bias = nn.Parameter(torch.randn(self.A, self.D) * 0.02)
         self.evidence_norm = nn.LayerNorm(self.D)
         self.cell_norm = nn.LayerNorm(self.D)
+        if self.latent_roles_enabled:
+            role_std = float(getattr(cfg, "role_init_std", 0.02))
+            self.role_embed = nn.Parameter(torch.randn(self.role_count, self.D) * role_std)
+            self.role_logits = nn.Parameter(torch.randn(int(cfg.layers), int(cfg.steps), self.role_count) * role_std)
 
         self.steps = nn.ModuleList([
             AssemblerStep(cfg, layer=l, step=s)
             for l in range(cfg.layers)
             for s in range(cfg.steps)
         ])
+
+    def _role_mix(self) -> torch.Tensor | None:
+        if not self.latent_roles_enabled:
+            return None
+        tau = max(0.05, float(getattr(self.cfg, "role_temperature", 1.25)))
+        return torch.softmax(self.role_logits.float() / tau, dim=-1)
+
+    def _role_contexts(self, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+        mix = self._role_mix()
+        if mix is None:
+            return None, None
+        embed = self.role_embed.to(device=device, dtype=torch.float32)
+        ctx = torch.einsum("lsr,rd->lsd", mix.to(device=device), embed).to(dtype=dtype)
+        return mix.to(device=device), ctx
+
+    def _role_similarity(self, role_mix: torch.Tensor | None) -> torch.Tensor | None:
+        if role_mix is None:
+            return None
+        flat = role_mix.float().reshape(-1, role_mix.shape[-1])
+        flat = F.normalize(flat, dim=-1)
+        sim = torch.matmul(flat, flat.t())
+        eye = torch.eye(sim.shape[0], device=sim.device, dtype=sim.dtype)
+        if sim.shape[0] <= 1:
+            return torch.zeros((), device=sim.device, dtype=sim.dtype)
+        return (sim - eye).sum() / float(sim.numel() - sim.shape[0])
 
     def config_dict(self) -> Dict[str, object]:
         return {
@@ -615,6 +810,13 @@ class MatrixProgramAssemblerCore(nn.Module):
             "channel_stages": self.cfg.channel_stages,
             "dropout": self.cfg.dropout,
             "use_deltas": self.cfg.use_deltas,
+            "operator_v2": bool(getattr(self.cfg, "operator_v2", False)),
+            "step_alive_init": float(getattr(self.cfg, "step_alive_init", 1.65)),
+            "phase_prior_strength": float(getattr(self.cfg, "phase_prior_strength", 0.0)),
+            "latent_roles": bool(getattr(self.cfg, "latent_roles", False)),
+            "role_count": int(getattr(self.cfg, "role_count", 6)),
+            "role_temperature": float(getattr(self.cfg, "role_temperature", 1.25)),
+            "role_init_std": float(getattr(self.cfg, "role_init_std", 0.02)),
             "primitives": list(PRIMITIVES),
         }
 
@@ -646,9 +848,21 @@ class MatrixProgramAssemblerCore(nn.Module):
                 "flow_editor.scale_delta",
                 "flow_editor.variant_editors",
                 "phase_mix_delta",
+                "phase_extra_delta",
+                "opv2_",
+                "step_alive",
+                "role_",
             )
             for name, p in self.named_parameters():
-                p.requires_grad = name.endswith("_delta") and any(key in name for key in allowed)
+                p.requires_grad = (
+                    (name.endswith("_delta") and any(key in name for key in allowed))
+                    or ("step_alive_logit" in name)
+                    or ("role_logits" in name)
+                    or ("role_embed" in name)
+                    or ("role_flow" in name)
+                    or ("role_step_alive" in name)
+                    or ("role_operator" in name)
+                )
             return
         if mode == "delta":
             self.set_delta_mode(True)
@@ -673,6 +887,7 @@ class MatrixProgramAssemblerCore(nn.Module):
             raise ValueError(f"evidence dim mismatch: expected {self.D}, got {evidence.shape[-1]}")
 
         cells = self.init_cells(evidence)
+        role_mix, role_contexts = self._role_contexts(evidence.device, evidence.dtype)
         update_slots: List[torch.Tensor] = []
         read_flows: List[torch.Tensor] = []
         prim_flows: List[torch.Tensor] = []
@@ -683,12 +898,15 @@ class MatrixProgramAssemblerCore(nn.Module):
         gates: List[torch.Tensor] = []
         updates: List[torch.Tensor] = []
         ent_acc: Dict[str, List[torch.Tensor]] = {
-            "read": [], "primitive": [], "slot_transition": [], "primitive_transition": [], "write": []
+            "read": [], "primitive": [], "slot_transition": [], "primitive_transition": [], "write": [], "step_alive": []
         }
 
         slot_names: List[str] = []
         for ti, step in enumerate(self.steps):
-            cells, update, info = step(cells)
+            layer = ti // self.cfg.steps
+            substep = ti % self.cfg.steps
+            role_context = role_contexts[layer, substep] if role_contexts is not None else None
+            cells, update, info = step(cells, role_context=role_context)
             update_slots.append(update)  # [N,B,D]
             read_flows.append(info["read_flow"])
             prim_flows.append(info["primitive_slot_flow"])
@@ -703,16 +921,24 @@ class MatrixProgramAssemblerCore(nn.Module):
             ent_acc["slot_transition"].append(info["entropy_slot_transition"])
             ent_acc["primitive_transition"].append(info["entropy_primitive_transition"])
             ent_acc["write"].append(info["entropy_write"])
-            layer = ti // self.cfg.steps
-            substep = ti % self.cfg.steps
-            phase = PHASES[min(layer, len(PHASES) - 1)]
-            slot_names.extend([f"L{layer}.{phase}.S{substep}.B{b}" for b in range(self.B)])
+            ent_acc["step_alive"].append(info["step_alive"])
+            if role_mix is not None:
+                rid = int(role_mix[layer, substep].argmax().detach().cpu())
+                tag = f"role{rid}"
+            else:
+                phase = PHASES[min(layer, len(PHASES) - 1)]
+                tag = phase
+            slot_names.extend([f"L{layer}.{tag}.S{substep}.B{b}" for b in range(self.B)])
 
         slots = torch.cat(update_slots, dim=1) if update_slots else cells[:, : self.B]
         mem0 = self.B
         glob0 = self.B + self.cfg.memory_cells
         memory_usage = torch.stack(write_flows).float()[..., mem0:glob0].sum(dim=-1).mean() if self.cfg.memory_cells > 0 else torch.tensor(0.0, device=evidence.device)
         global_usage = torch.stack(write_flows).float()[..., glob0:].sum(dim=-1).mean() if self.cfg.global_cells > 0 else torch.tensor(0.0, device=evidence.device)
+        role_usage = role_mix.float().mean(dim=(0, 1)) if role_mix is not None else None
+        role_entropy = _entropy(role_mix, dim=-1) if role_mix is not None else None
+        role_similarity = self._role_similarity(role_mix) if role_mix is not None else None
+        step_alive = torch.stack(ent_acc["step_alive"]).detach() if ent_acc.get("step_alive") else None
 
         aux = AssemblerAux(
             cells=cells,
@@ -730,6 +956,11 @@ class MatrixProgramAssemblerCore(nn.Module):
             entropies={k: torch.stack(v).mean() if v else torch.tensor(0.0, device=evidence.device) for k, v in ent_acc.items()},
             cell_names=self.cell_names(),
             slot_names=slot_names,
+            role_mix=role_mix if role_mix is not None else None,
+            role_usage=role_usage,
+            role_entropy=role_entropy,
+            role_similarity=role_similarity,
+            step_alive=step_alive,
         )
         return cells, aux
 
