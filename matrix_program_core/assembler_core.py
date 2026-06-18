@@ -64,6 +64,8 @@ class AssemblerConfig:
     role_count: int = 6
     role_temperature: float = 1.25
     role_init_std: float = 0.02
+    role_effect_init_std: float = 0.04
+    role_bias_scale: float = 1.0
 
     @property
     def address_cells(self) -> int:
@@ -91,7 +93,10 @@ class AssemblerAux:
     role_usage: torch.Tensor | None = None
     role_entropy: torch.Tensor | None = None
     role_similarity: torch.Tensor | None = None
+    role_effect_similarity: torch.Tensor | None = None
     step_alive: torch.Tensor | None = None
+    input_proxy_read: torch.Tensor | None = None
+    read_group_mass: torch.Tensor | None = None
 
 
 def _entropy(p: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -588,19 +593,42 @@ class AssemblerStep(nn.Module):
         # variants [...,V,D], weights [V]
         return torch.einsum("v,...vd->...d", weights, variants)
 
-    def _operator_role_biases(self, role_context: torch.Tensor | None, device: torch.device, dtype: torch.dtype):
-        if not bool(getattr(self.cfg, "latent_roles", False)) or role_context is None:
+    def _operator_role_biases(
+        self,
+        role_context: torch.Tensor | None,
+        device: torch.device,
+        dtype: torch.dtype,
+        shared_operator_bias: torch.Tensor | None = None,
+    ):
+        if not bool(getattr(self.cfg, "latent_roles", False)):
             return (None, None, None, None, None, None)
-        raw = self.role_operator(role_context.to(device=device, dtype=torch.float32).view(1, -1)).squeeze(0)
+        if role_context is None:
+            if shared_operator_bias is None:
+                return (None, None, None, None, None, None)
+            raw = shared_operator_bias.to(device=device, dtype=torch.float32)
+        else:
+            raw = self.role_operator(role_context.to(device=device, dtype=torch.float32).view(1, -1)).squeeze(0)
+            if shared_operator_bias is not None:
+                raw = raw + shared_operator_bias.to(device=device, dtype=torch.float32)
         raw = raw.to(device=device, dtype=dtype)
         return torch.split(raw, [3, 3, 3, 4, 3, 4], dim=0)
 
-    def _primitive_outputs(self, read_ctx: torch.Tensor, role_context: torch.Tensor | None = None) -> torch.Tensor:
+    def _primitive_outputs(
+        self,
+        read_ctx: torch.Tensor,
+        role_context: torch.Tensor | None = None,
+        role_operator_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # read_ctx: [N,B,K,D] -> [N,B,K,P,D]
         N, B, K, D = read_ctx.shape
         flat = read_ctx.reshape(N * B * K, D)
         dev, dtype = read_ctx.device, read_ctx.dtype
-        ch_bias, bl_bias, low_bias, ctx_bias, pr_bias, phase_bias = self._operator_role_biases(role_context, dev, dtype)
+        ch_bias, bl_bias, low_bias, ctx_bias, pr_bias, phase_bias = self._operator_role_biases(
+            role_context,
+            dev,
+            dtype,
+            shared_operator_bias=role_operator_bias,
+        )
 
         ctx_lin_flat = flat @ self.ctx_w.to(device=dev, dtype=dtype)
         smooth_flat = self._local_smooth_flat(flat)
@@ -675,7 +703,12 @@ class AssemblerStep(nn.Module):
         phase = torch.einsum("f,nbkfd->nbkd", phase_w, phase_candidates)
         return torch.stack([channel, block, low, ctx_m, product, phase], dim=3)
 
-    def forward(self, cells: torch.Tensor, role_context: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        cells: torch.Tensor,
+        role_context: torch.Tensor | None = None,
+        role_biases: Tuple[torch.Tensor, ...] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         # cells: [N,A,D]
         cells = self.matrix_attention(cells, use_deltas=self.cfg.use_deltas)
         read_logits = self._eff(self.read_logits, self.read_delta)
@@ -687,6 +720,16 @@ class AssemblerStep(nn.Module):
 
         read_b, prim_b, slot_b, ptrans_b, comp_b, write_b = self._context_flow_bias(cells, role_context=role_context)
         read_e, prim_e, slot_e, ptrans_e, comp_e, write_e = self.flow_editor(cells, use_deltas=self.cfg.use_deltas)
+        role_alive_bias = None
+        role_operator_bias = None
+        if role_biases is not None:
+            rb, pb, sb, ptb, cb, wb, role_alive_bias, role_operator_bias = role_biases
+            read_b = read_b + rb.to(device=cells.device, dtype=read_b.dtype).view(1, self.B, self.K, self.A)
+            prim_b = prim_b + pb.to(device=cells.device, dtype=prim_b.dtype).view(1, self.B, self.K, self.P)
+            slot_b = slot_b + sb.to(device=cells.device, dtype=slot_b.dtype).view(1, self.B, self.K, self.K)
+            ptrans_b = ptrans_b + ptb.to(device=cells.device, dtype=ptrans_b.dtype).view(1, self.P, self.P)
+            comp_b = comp_b + cb.to(device=cells.device, dtype=comp_b.dtype).view(1, self.B, self.K)
+            write_b = write_b + wb.to(device=cells.device, dtype=write_b.dtype).view(1, self.B, self.A)
         read_w = torch.softmax(read_logits.float().unsqueeze(0) + read_b.float() + read_e.float(), dim=-1).to(cells.dtype)        # [N,B,K,A]
         prim_w = torch.softmax(prim_logits.float().unsqueeze(0) + prim_b.float() + prim_e.float(), dim=-1).to(cells.dtype)        # [N,B,K,P]
         slot_trans = torch.softmax(slot_trans_logits.float().unsqueeze(0) + slot_b.float() + slot_e.float(), dim=-1).to(cells.dtype) # [N,B,K,K]
@@ -695,7 +738,11 @@ class AssemblerStep(nn.Module):
         write_w = torch.softmax(write_logits.float().unsqueeze(0) + write_b.float() + write_e.float(), dim=-1).to(cells.dtype)      # [N,B,A]
 
         read_ctx = torch.einsum("nbka,nad->nbkd", read_w, cells)                   # [N,B,K,D]
-        prim_out = self._primitive_outputs(read_ctx, role_context=role_context)     # [N,B,K,P,D]
+        prim_out = self._primitive_outputs(
+            read_ctx,
+            role_context=role_context,
+            role_operator_bias=role_operator_bias,
+        )     # [N,B,K,P,D]
 
         # Factorized transitions: primitive type transition and slot transition.
         prim_mixed = torch.einsum("npq,nbkqd->nbkpd", prim_trans, prim_out)        # [N,B,K,P,D]
@@ -710,6 +757,8 @@ class AssemblerStep(nn.Module):
         if bool(getattr(self.cfg, "latent_roles", False)) and role_context is not None:
             role_alive = self.role_step_alive(role_context.to(device=cells.device, dtype=torch.float32).view(1, -1)).squeeze()
             step_alive_logit = step_alive_logit + role_alive.to(device=cells.device, dtype=step_alive_logit.dtype)
+        if role_alive_bias is not None:
+            step_alive_logit = step_alive_logit + role_alive_bias.to(device=cells.device, dtype=step_alive_logit.dtype)
         step_alive = torch.sigmoid(step_alive_logit.to(device=cells.device, dtype=cells.dtype))
         active_update = step_alive * update
 
@@ -762,8 +811,21 @@ class MatrixProgramAssemblerCore(nn.Module):
         self.cell_norm = nn.LayerNorm(self.D)
         if self.latent_roles_enabled:
             role_std = float(getattr(cfg, "role_init_std", 0.02))
+            effect_std = float(getattr(cfg, "role_effect_init_std", 0.04))
             self.role_embed = nn.Parameter(torch.randn(self.role_count, self.D) * role_std)
             self.role_logits = nn.Parameter(torch.randn(int(cfg.layers), int(cfg.steps), self.role_count) * role_std)
+            # Shared role effects make role0/role1/... mean the same kind of
+            # matrix-program pressure in every layer/step. The per-step
+            # adapters still exist, but these tensors prevent roles from being
+            # merely local decorative context.
+            self.role_read_bias = nn.Parameter(torch.randn(self.role_count, self.B, self.K, self.A) * effect_std)
+            self.role_primitive_bias = nn.Parameter(torch.randn(self.role_count, self.B, self.K, self.P) * effect_std)
+            self.role_slot_transition_bias = nn.Parameter(torch.randn(self.role_count, self.B, self.K, self.K) * effect_std)
+            self.role_primitive_transition_bias = nn.Parameter(torch.randn(self.role_count, self.P, self.P) * effect_std)
+            self.role_composition_bias = nn.Parameter(torch.randn(self.role_count, self.B, self.K) * effect_std)
+            self.role_write_bias = nn.Parameter(torch.randn(self.role_count, self.B, self.A) * effect_std)
+            self.role_alive_bias = nn.Parameter(torch.randn(self.role_count) * effect_std)
+            self.role_operator_bias = nn.Parameter(torch.randn(self.role_count, 20) * effect_std)
 
         self.steps = nn.ModuleList([
             AssemblerStep(cfg, layer=l, step=s)
@@ -796,6 +858,49 @@ class MatrixProgramAssemblerCore(nn.Module):
             return torch.zeros((), device=sim.device, dtype=sim.dtype)
         return (sim - eye).sum() / float(sim.numel() - sim.shape[0])
 
+    def _role_effect_biases(
+        self,
+        mix: torch.Tensor | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, ...] | None:
+        if not self.latent_roles_enabled or mix is None:
+            return None
+        scale = float(getattr(self.cfg, "role_bias_scale", 1.0))
+        m = mix.to(device=device, dtype=torch.float32)
+        tensors = (
+            self.role_read_bias,
+            self.role_primitive_bias,
+            self.role_slot_transition_bias,
+            self.role_primitive_transition_bias,
+            self.role_composition_bias,
+            self.role_write_bias,
+            self.role_alive_bias,
+            self.role_operator_bias,
+        )
+        return tuple((scale * torch.einsum("r,r...->...", m, t.float())).to(device=device, dtype=dtype) for t in tensors)
+
+    def _role_effect_similarity(self) -> torch.Tensor | None:
+        if not self.latent_roles_enabled:
+            return None
+        parts = [
+            self.role_read_bias.reshape(self.role_count, -1),
+            self.role_primitive_bias.reshape(self.role_count, -1),
+            self.role_slot_transition_bias.reshape(self.role_count, -1),
+            self.role_primitive_transition_bias.reshape(self.role_count, -1),
+            self.role_composition_bias.reshape(self.role_count, -1),
+            self.role_write_bias.reshape(self.role_count, -1),
+            self.role_alive_bias.reshape(self.role_count, -1),
+            self.role_operator_bias.reshape(self.role_count, -1),
+        ]
+        flat = torch.cat([p.float() for p in parts], dim=-1)
+        flat = F.normalize(flat, dim=-1)
+        sim = torch.matmul(flat, flat.t())
+        eye = torch.eye(sim.shape[0], device=sim.device, dtype=sim.dtype)
+        if sim.shape[0] <= 1:
+            return torch.zeros((), device=sim.device, dtype=sim.dtype)
+        return (sim - eye).sum() / float(sim.numel() - sim.shape[0])
+
     def config_dict(self) -> Dict[str, object]:
         return {
             "dim": self.cfg.dim,
@@ -817,6 +922,8 @@ class MatrixProgramAssemblerCore(nn.Module):
             "role_count": int(getattr(self.cfg, "role_count", 6)),
             "role_temperature": float(getattr(self.cfg, "role_temperature", 1.25)),
             "role_init_std": float(getattr(self.cfg, "role_init_std", 0.02)),
+            "role_effect_init_std": float(getattr(self.cfg, "role_effect_init_std", 0.04)),
+            "role_bias_scale": float(getattr(self.cfg, "role_bias_scale", 1.0)),
             "primitives": list(PRIMITIVES),
         }
 
@@ -862,6 +969,7 @@ class MatrixProgramAssemblerCore(nn.Module):
                     or ("role_flow" in name)
                     or ("role_step_alive" in name)
                     or ("role_operator" in name)
+                    or name.startswith("role_")
                 )
             return
         if mode == "delta":
@@ -887,6 +995,7 @@ class MatrixProgramAssemblerCore(nn.Module):
             raise ValueError(f"evidence dim mismatch: expected {self.D}, got {evidence.shape[-1]}")
 
         cells = self.init_cells(evidence)
+        initial_cells = cells
         role_mix, role_contexts = self._role_contexts(evidence.device, evidence.dtype)
         update_slots: List[torch.Tensor] = []
         read_flows: List[torch.Tensor] = []
@@ -897,6 +1006,8 @@ class MatrixProgramAssemblerCore(nn.Module):
         write_flows: List[torch.Tensor] = []
         gates: List[torch.Tensor] = []
         updates: List[torch.Tensor] = []
+        input_reads: List[torch.Tensor] = []
+        read_groups: List[torch.Tensor] = []
         ent_acc: Dict[str, List[torch.Tensor]] = {
             "read": [], "primitive": [], "slot_transition": [], "primitive_transition": [], "write": [], "step_alive": []
         }
@@ -906,7 +1017,9 @@ class MatrixProgramAssemblerCore(nn.Module):
             layer = ti // self.cfg.steps
             substep = ti % self.cfg.steps
             role_context = role_contexts[layer, substep] if role_contexts is not None else None
-            cells, update, info = step(cells, role_context=role_context)
+            role_biases = self._role_effect_biases(role_mix[layer, substep], evidence.device, evidence.dtype) if role_mix is not None else None
+            pre_cells = cells
+            cells, update, info = step(cells, role_context=role_context, role_biases=role_biases)
             update_slots.append(update)  # [N,B,D]
             read_flows.append(info["read_flow"])
             prim_flows.append(info["primitive_slot_flow"])
@@ -916,6 +1029,15 @@ class MatrixProgramAssemblerCore(nn.Module):
             write_flows.append(info["write_flow"])
             gates.append(info["write_gates"])
             updates.append(info["update_norms"])
+            raw_like = F.cosine_similarity(pre_cells.float(), initial_cells.float(), dim=-1).clamp(0.0, 1.0)  # [N,A]
+            input_reads.append(torch.einsum("nbka,na->n", info["read_flow"].float(), raw_like) / float(max(1, self.B * self.K)))
+            read_addr = info["read_flow"].float().mean(dim=(0, 1, 2))  # [A]
+            mem0 = self.B
+            glob0 = self.B + self.cfg.memory_cells
+            state_mass = read_addr[:mem0].sum()
+            memory_mass = read_addr[mem0:glob0].sum() if self.cfg.memory_cells > 0 else torch.zeros((), device=evidence.device)
+            global_mass = read_addr[glob0:].sum() if self.cfg.global_cells > 0 else torch.zeros((), device=evidence.device)
+            read_groups.append(torch.stack([state_mass, memory_mass, global_mass]))
             ent_acc["read"].append(info["entropy_read"])
             ent_acc["primitive"].append(info["entropy_primitive"])
             ent_acc["slot_transition"].append(info["entropy_slot_transition"])
@@ -938,7 +1060,10 @@ class MatrixProgramAssemblerCore(nn.Module):
         role_usage = role_mix.float().mean(dim=(0, 1)) if role_mix is not None else None
         role_entropy = _entropy(role_mix, dim=-1) if role_mix is not None else None
         role_similarity = self._role_similarity(role_mix) if role_mix is not None else None
+        role_effect_similarity = self._role_effect_similarity() if role_mix is not None else None
         step_alive = torch.stack(ent_acc["step_alive"]).detach() if ent_acc.get("step_alive") else None
+        input_proxy_read = torch.stack(input_reads, dim=0) if input_reads else None
+        read_group_mass = torch.stack(read_groups, dim=0) if read_groups else None
 
         aux = AssemblerAux(
             cells=cells,
@@ -960,7 +1085,10 @@ class MatrixProgramAssemblerCore(nn.Module):
             role_usage=role_usage,
             role_entropy=role_entropy,
             role_similarity=role_similarity,
+            role_effect_similarity=role_effect_similarity,
             step_alive=step_alive,
+            input_proxy_read=input_proxy_read,
+            read_group_mass=read_group_mass,
         )
         return cells, aux
 

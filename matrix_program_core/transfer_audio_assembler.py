@@ -315,6 +315,8 @@ class AudioAssemblerModel(nn.Module):
             role_count=int(getattr(args, "role_count", 6)),
             role_temperature=float(getattr(args, "role_temperature", 1.25)),
             role_init_std=float(getattr(args, "role_init_std", 0.02)),
+            role_effect_init_std=float(getattr(args, "role_effect_init_std", 0.04)),
+            role_bias_scale=float(getattr(args, "role_bias_scale", 1.0)),
         )
         self.assembler_core = MatrixProgramAssemblerCore(cfg)
         self.head = AudioAssemblerHead(
@@ -698,6 +700,30 @@ def role_similarity_loss(aux, margin: float) -> torch.Tensor:
     return F.relu(off - float(margin)).mean()
 
 
+def role_effect_similarity_loss(aux, margin: float) -> torch.Tensor:
+    sim = getattr(aux, "role_effect_similarity", None)
+    if sim is None:
+        return torch.zeros((), device=aux.cells.device)
+    return F.relu(sim.float() - float(margin)).pow(2)
+
+
+def late_input_shortcut_loss(aux, layers: int, steps: int, start_layer: int, target: float) -> torch.Tensor:
+    x = getattr(aux, "input_proxy_read", None)
+    if x is None:
+        return torch.zeros((), device=aux.cells.device)
+    # x [T,N] estimates how much a step reads cells still close to init_cells.
+    # This is a soft proxy for raw-input shortcut in the current address-cell
+    # design, where evidence itself is not an explicit read group.
+    T = int(x.shape[0])
+    layer_ids = torch.arange(T, device=x.device) // max(1, int(steps))
+    mask = layer_ids >= int(start_layer)
+    if not bool(mask.any()):
+        return torch.zeros((), device=x.device)
+    depth = (layer_ids.float() / float(max(1, int(layers) - 1))).view(T, 1)
+    over = F.relu(x.float() - float(target))
+    return (over[mask].pow(2) * (1.0 + depth[mask])).mean()
+
+
 def _norm_entropy_focus(p: torch.Tensor, dim: int = -1) -> torch.Tensor:
     p = p.float().clamp_min(1e-8)
     p = p / p.sum(dim=dim, keepdim=True).clamp_min(1e-8)
@@ -879,8 +905,18 @@ def aux_losses(logits: torch.Tensor, aux, haux, args, flow_targets, skill_weight
     out["role_usage_balance"] = role_usage_balance_loss(aux, args.role_usage_entropy_floor)
     out["role_entropy_band"] = role_entropy_band_loss(aux, args.role_entropy_low, args.role_entropy_high)
     out["role_similarity"] = role_similarity_loss(aux, args.role_similarity_margin)
+    out["role_effect_similarity"] = role_effect_similarity_loss(aux, args.role_effect_similarity_margin)
     out["role_usage_max"] = aux.role_usage.float().max() if getattr(aux, "role_usage", None) is not None else torch.zeros((), device=logits.device)
     out["role_entropy"] = aux.role_entropy.float().mean() if getattr(aux, "role_entropy", None) is not None else torch.zeros((), device=logits.device)
+    out["role_effect_sim_value"] = aux.role_effect_similarity.float() if getattr(aux, "role_effect_similarity", None) is not None else torch.zeros((), device=logits.device)
+    out["late_input_shortcut"] = late_input_shortcut_loss(
+        aux,
+        args.layers,
+        args.steps,
+        args.late_input_start_layer,
+        args.late_input_target,
+    )
+    out["input_proxy_read"] = aux.input_proxy_read.float().mean() if getattr(aux, "input_proxy_read", None) is not None else torch.zeros((), device=logits.device)
     out.update(semantic_lint_losses(aux, haux, args))
     out["logit_norm"] = logits.float().pow(2).mean()
     out["pair_update_norm"] = haux["pair_update_norm"].float()
@@ -921,6 +957,8 @@ def train_epoch(model, loader, opt, scaler, device, dtype, args, epoch: int, flo
             loss = loss + args.lambda_role_usage_balance * losses["role_usage_balance"]
             loss = loss + args.lambda_role_entropy_band * losses["role_entropy_band"]
             loss = loss + args.lambda_role_similarity * losses["role_similarity"]
+            loss = loss + args.lambda_role_effect_similarity * losses["role_effect_similarity"]
+            loss = loss + args.lambda_late_input_shortcut * losses["late_input_shortcut"]
             loss = loss + args.lambda_semantic_lint * losses["semantic_lint"]
             loss = loss + args.lambda_logit_norm * losses["logit_norm"]
         if not torch.isfinite(loss):
@@ -981,6 +1019,13 @@ def evaluate(model, loader, device, dtype, args, flow_targets, skill_weights):
             "role_mix": aux.role_mix.detach().cpu().tolist() if getattr(aux, "role_mix", None) is not None else None,
             "role_entropy_mean": float(aux.role_entropy.float().mean().detach().cpu()) if getattr(aux, "role_entropy", None) is not None else 0.0,
             "role_similarity": float(aux.role_similarity.detach().cpu()) if getattr(aux, "role_similarity", None) is not None else 0.0,
+            "role_effect_similarity": float(aux.role_effect_similarity.detach().cpu()) if getattr(aux, "role_effect_similarity", None) is not None else 0.0,
+            "input_proxy_read": aux.input_proxy_read.float().mean(dim=1).detach().cpu().tolist() if getattr(aux, "input_proxy_read", None) is not None else None,
+            "read_group_mass": {
+                "names": ["state", "memory", "global"],
+                "by_step": aux.read_group_mass.detach().cpu().tolist() if getattr(aux, "read_group_mass", None) is not None else None,
+                "mean": aux.read_group_mass.float().mean(dim=0).detach().cpu().tolist() if getattr(aux, "read_group_mass", None) is not None else None,
+            },
             "semantic_frame_summary": semantic_report(aux, haux, args),
             "phase_mass_mean": {
                 PHASES[i]: float(haux["class_phase_mass"].float().mean(dim=(0, 1))[i].detach().cpu())
@@ -1052,7 +1097,8 @@ def run(args) -> None:
         "skill", "read_flow_kl", "primitive_slot_kl", "slot_transition_kl", "primitive_transition_kl", "slot_composition_kl", "write_flow_kl",
         "write_budget", "update_alive", "class_read_div", "class_slot_prior", "class_attn_entropy", "phase_balance", "slot_div", "layer_sim", "step_sim",
         "primitive_balance", "cell_balance", "entropy_band", "step_alive_budget",
-        "role_usage_balance", "role_entropy_band", "role_similarity", "role_usage_max", "role_entropy",
+        "role_usage_balance", "role_entropy_band", "role_similarity", "role_effect_similarity", "role_effect_sim_value", "role_usage_max", "role_entropy",
+        "late_input_shortcut", "input_proxy_read",
         "semantic_lint", "semantic_no_read", "semantic_no_transform", "semantic_memory_global", "semantic_dead_slot",
         "semantic_write_consumer", "semantic_early_write", "semantic_transition",
         "logit_norm",
@@ -1153,6 +1199,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--role-count", type=int, default=6)
     p.add_argument("--role-temperature", type=float, default=1.25)
     p.add_argument("--role-init-std", type=float, default=0.02)
+    p.add_argument("--role-effect-init-std", type=float, default=0.04)
+    p.add_argument("--role-bias-scale", type=float, default=1.0)
     p.add_argument("--pair-slots", type=int, default=12)
     p.add_argument("--dropout", type=float, default=0.04)
     p.add_argument("--head-dropout", type=float, default=0.05)
@@ -1189,6 +1237,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--lambda-role-usage-balance", type=float, default=0.000)
     p.add_argument("--lambda-role-entropy-band", type=float, default=0.000)
     p.add_argument("--lambda-role-similarity", type=float, default=0.000)
+    p.add_argument("--lambda-role-effect-similarity", type=float, default=0.000)
+    p.add_argument("--lambda-late-input-shortcut", type=float, default=0.000)
     p.add_argument("--lambda-semantic-lint", type=float, default=0.000)
     p.add_argument("--primitive-balance-entropy-floor", type=float, default=0.72)
     p.add_argument("--cell-balance-entropy-floor", type=float, default=0.62)
@@ -1199,6 +1249,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--role-entropy-low", type=float, default=0.35)
     p.add_argument("--role-entropy-high", type=float, default=0.92)
     p.add_argument("--role-similarity-margin", type=float, default=0.78)
+    p.add_argument("--role-effect-similarity-margin", type=float, default=0.15)
+    p.add_argument("--late-input-start-layer", type=int, default=1)
+    p.add_argument("--late-input-target", type=float, default=0.55)
     p.add_argument("--semantic-min-read-focus", type=float, default=0.04)
     p.add_argument("--semantic-min-transform-focus", type=float, default=0.06)
     p.add_argument("--semantic-min-memory-global", type=float, default=0.03)

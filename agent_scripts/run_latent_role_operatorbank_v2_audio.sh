@@ -34,8 +34,10 @@ DIM="${DIM:-96}"
 EVIDENCE_CELLS="${EVIDENCE_CELLS:-48}"
 PAIR_SLOTS="${PAIR_SLOTS:-12}"
 ROLE_COUNT="${ROLE_COUNT:-6}"
-ROLE_TEMPERATURE="${ROLE_TEMPERATURE:-1.25}"
-ROLE_INIT_STD="${ROLE_INIT_STD:-0.02}"
+ROLE_TEMPERATURE="${ROLE_TEMPERATURE:-0.85}"
+ROLE_INIT_STD="${ROLE_INIT_STD:-0.04}"
+ROLE_EFFECT_INIT_STD="${ROLE_EFFECT_INIT_STD:-0.08}"
+ROLE_BIAS_SCALE="${ROLE_BIAS_SCALE:-1.75}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
 ASSEMBLER_CKPT="${ASSEMBLER_CKPT:-}"
 PURE_LATENT="${PURE_LATENT:-1}"
@@ -54,21 +56,27 @@ LAMBDA_CLASS_ATTN_ENTROPY="${LAMBDA_CLASS_ATTN_ENTROPY:-0.0035}"
 LAMBDA_ROLE_USAGE_BALANCE="${LAMBDA_ROLE_USAGE_BALANCE:-0.010}"
 LAMBDA_ROLE_ENTROPY_BAND="${LAMBDA_ROLE_ENTROPY_BAND:-0.006}"
 LAMBDA_ROLE_SIMILARITY="${LAMBDA_ROLE_SIMILARITY:-0.012}"
+LAMBDA_ROLE_EFFECT_SIMILARITY="${LAMBDA_ROLE_EFFECT_SIMILARITY:-0.020}"
+LAMBDA_LATE_INPUT_SHORTCUT="${LAMBDA_LATE_INPUT_SHORTCUT:-0.060}"
 LAMBDA_SEMANTIC_LINT="${LAMBDA_SEMANTIC_LINT:-0.002}"
 ROLE_USAGE_ENTROPY_FLOOR="${ROLE_USAGE_ENTROPY_FLOOR:-0.72}"
 ROLE_ENTROPY_LOW="${ROLE_ENTROPY_LOW:-0.35}"
 ROLE_ENTROPY_HIGH="${ROLE_ENTROPY_HIGH:-0.92}"
 ROLE_SIMILARITY_MARGIN="${ROLE_SIMILARITY_MARGIN:-0.78}"
+ROLE_EFFECT_SIMILARITY_MARGIN="${ROLE_EFFECT_SIMILARITY_MARGIN:-0.05}"
+LATE_INPUT_START_LAYER="${LATE_INPUT_START_LAYER:-1}"
+LATE_INPUT_TARGET="${LATE_INPUT_TARGET:-0.58}"
 
 printf '\n[latent-role] repo=%s\n' "$ROOT"
 printf '[latent-role] report_dir=%s\n' "$REPORT_DIR"
 printf '[latent-role] modes=%s epochs=%s lr=%s amp=%s\n' "$AUDIO_MODES" "$EPOCHS_AUDIO" "$AUDIO_LR" "$AMP_AUDIO"
 printf '[latent-role] train_n=%s val_n=%s workers=%s pin_memory=%s\n' "$TRAIN_N" "$VAL_N" "$WORKERS" "$PIN_MEMORY"
-printf '[latent-role] architecture: layers=%s steps=%s blocks=%s K=%s memory=%s global=%s dim=%s roles=%s tau=%s\n' \
-  "$LAYERS" "$STEPS" "$BLOCKS" "$PRIMITIVE_SLOTS" "$MEMORY_CELLS" "$GLOBAL_CELLS" "$DIM" "$ROLE_COUNT" "$ROLE_TEMPERATURE"
+printf '[latent-role] architecture: layers=%s steps=%s blocks=%s K=%s memory=%s global=%s dim=%s roles=%s tau=%s effect_std=%s role_scale=%s\n' \
+  "$LAYERS" "$STEPS" "$BLOCKS" "$PRIMITIVE_SLOTS" "$MEMORY_CELLS" "$GLOBAL_CELLS" "$DIM" "$ROLE_COUNT" "$ROLE_TEMPERATURE" \
+  "$ROLE_EFFECT_INIT_STD" "$ROLE_BIAS_SCALE"
 printf '[latent-role] pure_latent=%s\n' "$PURE_LATENT"
-printf '[latent-role] role losses: usage=%s entropy=%s sim=%s\n\n' \
-  "$LAMBDA_ROLE_USAGE_BALANCE" "$LAMBDA_ROLE_ENTROPY_BAND" "$LAMBDA_ROLE_SIMILARITY"
+printf '[latent-role] role losses: usage=%s entropy=%s sim=%s effect_sim=%s late_input=%s target=%s start_layer=%s\n\n' \
+  "$LAMBDA_ROLE_USAGE_BALANCE" "$LAMBDA_ROLE_ENTROPY_BAND" "$LAMBDA_ROLE_SIMILARITY" "$LAMBDA_ROLE_EFFECT_SIMILARITY" "$LAMBDA_LATE_INPUT_SHORTCUT" "$LATE_INPUT_TARGET" "$LATE_INPUT_START_LAYER"
 printf '[latent-role] class losses: read_div=%s slot_prior=%s attn_entropy=%s\n' \
   "$LAMBDA_CLASS_READ_DIV" "$LAMBDA_CLASS_SLOT_PRIOR" "$LAMBDA_CLASS_ATTN_ENTROPY"
 printf '[latent-role] semantic_lint=%s\n\n' "$LAMBDA_SEMANTIC_LINT"
@@ -102,6 +110,7 @@ for MODE in $AUDIO_MODES; do
     --primitive-slots "$PRIMITIVE_SLOTS" --memory-cells "$MEMORY_CELLS" --global-cells "$GLOBAL_CELLS" \
     --channel-stages 3 --operator-v2 --step-alive-init 1.55 \
     --latent-roles --role-count "$ROLE_COUNT" --role-temperature "$ROLE_TEMPERATURE" --role-init-std "$ROLE_INIT_STD" \
+    --role-effect-init-std "$ROLE_EFFECT_INIT_STD" --role-bias-scale "$ROLE_BIAS_SCALE" \
     --pair-slots "$PAIR_SLOTS" \
     --phase-prior-strength 0.0 \
     --epochs "$EPOCHS_AUDIO" --lr "$AUDIO_LR" \
@@ -120,10 +129,14 @@ for MODE in $AUDIO_MODES; do
     --lambda-role-usage-balance "$LAMBDA_ROLE_USAGE_BALANCE" \
     --lambda-role-entropy-band "$LAMBDA_ROLE_ENTROPY_BAND" \
     --lambda-role-similarity "$LAMBDA_ROLE_SIMILARITY" \
+    --lambda-role-effect-similarity "$LAMBDA_ROLE_EFFECT_SIMILARITY" \
+    --lambda-late-input-shortcut "$LAMBDA_LATE_INPUT_SHORTCUT" \
     --lambda-semantic-lint "$LAMBDA_SEMANTIC_LINT" \
     --role-usage-entropy-floor "$ROLE_USAGE_ENTROPY_FLOOR" \
     --role-entropy-low "$ROLE_ENTROPY_LOW" --role-entropy-high "$ROLE_ENTROPY_HIGH" \
     --role-similarity-margin "$ROLE_SIMILARITY_MARGIN" \
+    --role-effect-similarity-margin "$ROLE_EFFECT_SIMILARITY_MARGIN" \
+    --late-input-start-layer "$LATE_INPUT_START_LAYER" --late-input-target "$LATE_INPUT_TARGET" \
     --primitive-balance-entropy-floor 0.72 \
     --cell-balance-entropy-floor 0.62 \
     --entropy-band-low 1.05 --entropy-band-high 2.45 \
@@ -159,7 +172,8 @@ for f in sorted(rd.glob("audio_*_final_report.json")):
             keys = [
                 "epoch", "train_ce", "train_acc", "val_acc", "best_acc",
                 "class_read_div", "slot_div", "layer_sim", "step_sim",
-                "role_usage_balance", "role_entropy_band", "role_similarity", "role_usage_max", "role_entropy",
+                "role_usage_balance", "role_entropy_band", "role_similarity", "role_effect_similarity", "role_effect_sim_value", "role_usage_max", "role_entropy",
+                "late_input_shortcut", "input_proxy_read",
                 "semantic_lint", "semantic_no_read", "semantic_no_transform", "semantic_memory_global",
                 "semantic_dead_slot", "semantic_write_consumer", "semantic_early_write", "semantic_transition",
                 "primitive_balance", "cell_balance", "entropy_band", "step_alive_budget",
@@ -177,7 +191,9 @@ REPORT="$REPORT_DIR/REPORT_TO_CHATGPT.txt"
   echo "AUDIO_MODES=$AUDIO_MODES"; echo "EPOCHS_AUDIO=$EPOCHS_AUDIO"; echo "AUDIO_LR=$AUDIO_LR"
   echo "PURE_LATENT=$PURE_LATENT"
   echo "LAYERS=$LAYERS"; echo "STEPS=$STEPS"; echo "ROLE_COUNT=$ROLE_COUNT"; echo "ROLE_TEMPERATURE=$ROLE_TEMPERATURE"
+  echo "ROLE_EFFECT_INIT_STD=$ROLE_EFFECT_INIT_STD"; echo "ROLE_BIAS_SCALE=$ROLE_BIAS_SCALE"
   echo "LAMBDA_CLASS_READ_DIV=$LAMBDA_CLASS_READ_DIV"; echo "LAMBDA_CLASS_SLOT_PRIOR=$LAMBDA_CLASS_SLOT_PRIOR"
+  echo "LAMBDA_ROLE_EFFECT_SIMILARITY=$LAMBDA_ROLE_EFFECT_SIMILARITY"; echo "LAMBDA_LATE_INPUT_SHORTCUT=$LAMBDA_LATE_INPUT_SHORTCUT"
   echo "LAMBDA_SEMANTIC_LINT=$LAMBDA_SEMANTIC_LINT"
   echo
   echo "## summary"; cat "$REPORT_DIR/summary.txt"
