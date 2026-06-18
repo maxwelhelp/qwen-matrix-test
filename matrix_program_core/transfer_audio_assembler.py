@@ -131,6 +131,7 @@ class AudioAssemblerHead(nn.Module):
         self.classes = int(classes)
         self.pair_slots = int(pair_slots)
         self.phase_prior_strength = float(phase_prior_strength)
+        self.phasefree_head = bool(getattr(cfg, "latent_roles", False)) and self.phase_prior_strength <= 0.0
 
         self.class_state = nn.Parameter(torch.randn(classes, dim) * 0.05)
         self.class_phase_logits = nn.Parameter(class_phase_prior(classes))
@@ -163,38 +164,57 @@ class AudioAssemblerHead(nn.Module):
 
     def forward(self, slots: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch, slot_count, dim = slots.shape
-        phase_map_prior = phase_slot_matrix(
-            self.cfg.layers,
-            self.cfg.steps,
-            self.cfg.blocks,
-            slots.device,
-            normalize_rows=True,
-        ).to(slots.dtype)
-        phase_map_mass = phase_slot_matrix(
-            self.cfg.layers,
-            self.cfg.steps,
-            self.cfg.blocks,
-            slots.device,
-            normalize_rows=False,
-        ).to(slots.dtype)
-        if phase_map_prior.shape[1] != slot_count:
-            phase_map_prior = F.interpolate(
-                phase_map_prior.unsqueeze(0),
-                size=slot_count,
-                mode="linear",
-                align_corners=False,
-            ).squeeze(0)
-            phase_map_prior = phase_map_prior / phase_map_prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            phase_map_mass = phase_map_prior * float(slot_count) / float(max(1, len(PHASES)))
+        phase_count = len(PHASES)
+        if self.phasefree_head:
+            # Latent-role mode must not reintroduce extract/compare/suppress/
+            # aggregate through the class head. Keep this diagnostic tensor
+            # neutral so old report fields remain readable without steering.
+            phase_map_mass = torch.full(
+                (phase_count, slot_count),
+                1.0 / float(max(1, phase_count)),
+                device=slots.device,
+                dtype=slots.dtype,
+            )
+            slot_prior = torch.full(
+                (self.classes, slot_count),
+                1.0 / float(max(1, slot_count)),
+                device=slots.device,
+                dtype=slots.dtype,
+            )
+        else:
+            phase_map_prior = phase_slot_matrix(
+                self.cfg.layers,
+                self.cfg.steps,
+                self.cfg.blocks,
+                slots.device,
+                normalize_rows=True,
+            ).to(slots.dtype)
+            phase_map_mass = phase_slot_matrix(
+                self.cfg.layers,
+                self.cfg.steps,
+                self.cfg.blocks,
+                slots.device,
+                normalize_rows=False,
+            ).to(slots.dtype)
+            if phase_map_prior.shape[1] != slot_count:
+                phase_map_prior = F.interpolate(
+                    phase_map_prior.unsqueeze(0),
+                    size=slot_count,
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(0)
+                phase_map_prior = phase_map_prior / phase_map_prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                phase_map_mass = phase_map_prior * float(slot_count) / float(max(1, len(PHASES)))
 
-        phase_w = torch.softmax(self.class_phase_logits.float(), dim=-1).to(slots.dtype)
-        slot_prior = torch.matmul(phase_w, phase_map_prior).clamp_min(1e-8)
+            phase_w = torch.softmax(self.class_phase_logits.float(), dim=-1).to(slots.dtype)
+            slot_prior = torch.matmul(phase_w, phase_map_prior).clamp_min(1e-8)
 
         keys = slots @ self.key_w.to(device=slots.device, dtype=slots.dtype)
         values = self.drop(slots @ self.value_w.to(device=slots.device, dtype=slots.dtype))
         q = self.class_state.to(device=slots.device, dtype=slots.dtype) @ self.class_q.to(device=slots.device, dtype=slots.dtype)
         score = torch.einsum("cd,nsd->ncs", q, keys) / math.sqrt(dim)
-        score = score + self.phase_prior_strength * slot_prior.log().view(1, self.classes, slot_count)
+        if self.phase_prior_strength > 0.0 and not self.phasefree_head:
+            score = score + self.phase_prior_strength * slot_prior.log().view(1, self.classes, slot_count)
         attn = torch.softmax(score.float(), dim=-1).to(slots.dtype)
         class_read = torch.einsum("ncs,nsd->ncd", attn, values)
 
