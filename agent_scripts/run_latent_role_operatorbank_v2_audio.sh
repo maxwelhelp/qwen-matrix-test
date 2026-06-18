@@ -43,6 +43,9 @@ LAMBDA_LAYER_SIM="${LAMBDA_LAYER_SIM:-0.020}"
 LAMBDA_STEP_SIM="${LAMBDA_STEP_SIM:-0.006}"
 LAYER_SIM_MARGIN="${LAYER_SIM_MARGIN:-0.22}"
 STEP_SIM_MARGIN="${STEP_SIM_MARGIN:-0.42}"
+LAMBDA_CLASS_READ_DIV="${LAMBDA_CLASS_READ_DIV:-0.075}"
+LAMBDA_CLASS_SLOT_PRIOR="${LAMBDA_CLASS_SLOT_PRIOR:-0.020}"
+LAMBDA_CLASS_ATTN_ENTROPY="${LAMBDA_CLASS_ATTN_ENTROPY:-0.0035}"
 LAMBDA_ROLE_USAGE_BALANCE="${LAMBDA_ROLE_USAGE_BALANCE:-0.010}"
 LAMBDA_ROLE_ENTROPY_BAND="${LAMBDA_ROLE_ENTROPY_BAND:-0.006}"
 LAMBDA_ROLE_SIMILARITY="${LAMBDA_ROLE_SIMILARITY:-0.012}"
@@ -60,6 +63,8 @@ printf '[latent-role] architecture: layers=%s steps=%s blocks=%s K=%s memory=%s 
   "$LAYERS" "$STEPS" "$BLOCKS" "$PRIMITIVE_SLOTS" "$MEMORY_CELLS" "$GLOBAL_CELLS" "$DIM" "$ROLE_COUNT" "$ROLE_TEMPERATURE"
 printf '[latent-role] role losses: usage=%s entropy=%s sim=%s\n\n' \
   "$LAMBDA_ROLE_USAGE_BALANCE" "$LAMBDA_ROLE_ENTROPY_BAND" "$LAMBDA_ROLE_SIMILARITY"
+printf '[latent-role] class losses: read_div=%s slot_prior=%s attn_entropy=%s\n' \
+  "$LAMBDA_CLASS_READ_DIV" "$LAMBDA_CLASS_SLOT_PRIOR" "$LAMBDA_CLASS_ATTN_ENTROPY"
 printf '[latent-role] semantic_lint=%s\n\n' "$LAMBDA_SEMANTIC_LINT"
 
 git rev-parse --short HEAD 2>/dev/null | sed 's/^/[latent-role] git_head=/' || true
@@ -97,7 +102,7 @@ for MODE in $AUDIO_MODES; do
     --lambda-skill 0 \
     --lambda-write-budget 0.020 --lambda-update-alive 0.004 \
     --lambda-phase-balance 0.000 --min-early-phase-mass 0.000 --max-aggregate-phase-mass 1.00 \
-    --lambda-class-read-div 0.075 --lambda-class-slot-prior 0.020 --lambda-class-attn-entropy 0.0035 \
+    --lambda-class-read-div "$LAMBDA_CLASS_READ_DIV" --lambda-class-slot-prior "$LAMBDA_CLASS_SLOT_PRIOR" --lambda-class-attn-entropy "$LAMBDA_CLASS_ATTN_ENTROPY" \
     --class-slot-prior-sigma 1.55 \
     --lambda-slot-div 0.010 \
     --lambda-layer-sim "$LAMBDA_LAYER_SIM" --lambda-step-sim "$LAMBDA_STEP_SIM" \
@@ -165,6 +170,7 @@ REPORT="$REPORT_DIR/REPORT_TO_CHATGPT.txt"
   echo "## config"
   echo "AUDIO_MODES=$AUDIO_MODES"; echo "EPOCHS_AUDIO=$EPOCHS_AUDIO"; echo "AUDIO_LR=$AUDIO_LR"
   echo "LAYERS=$LAYERS"; echo "STEPS=$STEPS"; echo "ROLE_COUNT=$ROLE_COUNT"; echo "ROLE_TEMPERATURE=$ROLE_TEMPERATURE"
+  echo "LAMBDA_CLASS_READ_DIV=$LAMBDA_CLASS_READ_DIV"; echo "LAMBDA_CLASS_SLOT_PRIOR=$LAMBDA_CLASS_SLOT_PRIOR"
   echo "LAMBDA_SEMANTIC_LINT=$LAMBDA_SEMANTIC_LINT"
   echo
   echo "## summary"; cat "$REPORT_DIR/summary.txt"
